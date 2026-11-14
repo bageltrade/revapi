@@ -208,7 +208,7 @@ def _send(
             raise LLMError(f"{reason} (gave up after {retries} retries)", kind)
         delay = _backoff(attempt, wait)
         (on_retry or (lambda a, n, w, r: _note(f"{r}; retry {a}/{n} in {w:.0f}s")))(attempt, retries, delay, reason)
-        time.sleep(delay)
+        _sleep(delay)
 
     while True:
         req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json", "User-Agent": "revapi", **headers}, method="POST")
@@ -223,7 +223,7 @@ def _send(
             if e.code in (402, 429) and wait is not None and throttled < 400 and re.search(r"[Rr]etry (?:after|in) \d", text):
                 throttled += 1  # free tiers say exactly how long to wait; not a failure
                 (on_retry or (lambda a, n, w, r: _note(f"{r}; waiting {w:.0f}s")))(0, retries, wait + 1, f"provider throttled (HTTP {e.code})")
-                time.sleep(wait + 1)
+                _sleep(wait + 1)
                 continue
             if e.code in (400, 413, 422) and is_context_error(text):
                 err = LLMError(f"context window exceeded: {text[:600]}", "context_length")
@@ -275,6 +275,13 @@ def _read_json(resp: Any) -> dict:
         err.retryable = True  # type: ignore[attr-defined]
         raise err
     return json.loads(raw.decode())
+
+
+def _sleep(seconds: float) -> None:
+    """Wait in short slices, so stopping a run (esc in the session) never waits out a long backoff."""
+    end = time.monotonic() + max(0.0, seconds)
+    while (left := end - time.monotonic()) > 0:
+        time.sleep(min(0.2, left))
 
 
 def _post(url: str, body: dict, headers: dict[str, str], timeout: float, retries: int = DEFAULT_RETRIES, on_retry: RetryHook | None = None) -> dict:
@@ -449,6 +456,15 @@ CONTEXT_WINDOWS: dict[str, int] = {
     "openai": 128_000,
 }
 DEFAULT_WINDOW = 128_000
+# RAE's five efforts. OpenAI-style APIs take low|medium|high, so xhigh and max ask for "high" there; Anthropic gets
+# a thinking budget per level.
+THINKING_BUDGET = {"low": 2048, "medium": 8000, "high": 24000, "xhigh": 32000, "max": 48000}
+
+
+def wire_effort(effort: str) -> str:
+    return "high" if effort in ("xhigh", "max") else effort
+
+
 OPTIONAL_KEYS = ("stream_options", "chat_template_kwargs", "reasoning", "include_reasoning", "reasoning_effort", "tool_choice", "parallel_tool_calls", "usage")
 INTERNAL_KEYS = ("reasoning", "thinking_blocks", "_seq", "seq", "ts", "usage")
 
@@ -580,10 +596,11 @@ class LLM:
         if self.provider not in ("pollinations",):
             body["max_completion_tokens" if self.provider == "openai" else "max_tokens"] = self.max_tokens
         if self.effort:
+            level = wire_effort(self.effort)
             if self.provider == "openrouter":
-                opt["reasoning"] = {"effort": self.effort}
+                opt["reasoning"] = {"effort": level}
             elif self.provider in ("openai", "groq", "xai", "gemini", "cerebras", "together", "custom"):
-                opt["reasoning_effort"] = self.effort
+                opt["reasoning_effort"] = level
             elif self.provider in ("nvidia", "ollama", "lmstudio"):
                 opt["chat_template_kwargs"] = {"thinking": True, "enable_thinking": True}
         if self.provider == "openrouter":
@@ -749,8 +766,8 @@ class LLM:
             body["tools"][-1]["cache_control"] = {"type": "ephemeral"}
         if conv and isinstance(conv[-1]["content"], list) and conv[-1]["content"]:
             conv[-1]["content"][-1]["cache_control"] = {"type": "ephemeral"}
-        if self.effort in ("low", "medium", "high"):
-            budget = {"low": 2048, "medium": 8000, "high": 24000}[self.effort]
+        if self.effort in THINKING_BUDGET:
+            budget = THINKING_BUDGET[self.effort]
             body["thinking"] = {"type": "enabled", "budget_tokens": budget}
             body["max_tokens"] = max(self.max_tokens, budget + 4000)
         if stream:

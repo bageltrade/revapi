@@ -360,7 +360,7 @@ class Unit(unittest.TestCase):
         plan.append(_json({"choices": [{"message": {"content": "back online"}}]}))
         net = FakeNet(plan)
         retries: list[tuple[int, int, str]] = []
-        with net, mock.patch("time.sleep") as slept:
+        with net, mock.patch("revapi.llm._sleep") as slept:
             r = LLM(provider="openai", api_key="k", stream=False).chat([{"role": "user", "content": "x"}], on_retry=lambda a, n, w, why: retries.append((a, n, why)))
         self.assertEqual(r.content, "back online")
         self.assertEqual([a for a, _, _ in retries], [1, 2, 3, 4, 5, 6, 7])
@@ -375,7 +375,7 @@ class Unit(unittest.TestCase):
         import urllib.error
 
         net = FakeNet([urllib.error.URLError("offline")] * 60)
-        with net, mock.patch("time.sleep"):
+        with net, mock.patch("revapi.llm._sleep"):
             with self.assertRaises(llmmod.LLMError) as cm:
                 LLM(provider="openai", api_key="k", stream=False).chat([{"role": "user", "content": "x"}], on_retry=lambda *a: None)
         self.assertEqual(cm.exception.kind, "network")
@@ -385,12 +385,12 @@ class Unit(unittest.TestCase):
 
     def test_auth_errors_fail_fast_and_retry_after(self) -> None:
         net = FakeNet([_http_error(401, '{"error":"bad key"}')])
-        with net, mock.patch("time.sleep"):
+        with net, mock.patch("revapi.llm._sleep"):
             with self.assertRaises(llmmod.LLMError) as cm:
                 LLM(provider="openai", api_key="k", stream=False).chat([{"role": "user", "content": "x"}])
         self.assertEqual((cm.exception.kind, len(net.calls)), ("auth", 1))
         net = FakeNet([_http_error(429, "slow down", {"retry-after": "7"}), _json({"choices": [{"message": {"content": "ok"}}]})])
-        with net, mock.patch("time.sleep") as slept:
+        with net, mock.patch("revapi.llm._sleep") as slept:
             LLM(provider="openai", api_key="k", stream=False).chat([{"role": "user", "content": "x"}], on_retry=lambda *a: None)
         self.assertEqual(slept.call_args_list[0].args[0], 7.5)  # Retry-After honoured
 
@@ -400,7 +400,7 @@ class Unit(unittest.TestCase):
         cut = _Resp(b'data: {"choices": [{"delta": {"reasoning_content": "partial thou"}}]}\n\n', "text/event-stream")  # closed cleanly, but no [DONE]
         net = FakeNet([broken, cut, good])
         seen: list[str] = []
-        with net, mock.patch("time.sleep"):
+        with net, mock.patch("revapi.llm._sleep"):
             r = LLM(provider="openai", api_key="k").chat([{"role": "user", "content": "x"}], on_delta=lambda k, p: seen.append(k), on_retry=lambda *a: None)
         self.assertEqual(r.content, "complete answer")
         self.assertEqual(seen.count("reset"), 2)
@@ -410,7 +410,7 @@ class Unit(unittest.TestCase):
         bad = _sse_resp([{"error": {"message": "Provider overloaded, try again", "code": 503}}])
         good = _sse_resp([{"choices": [{"delta": {"content": "fine"}, "finish_reason": "stop"}]}])
         net = FakeNet([bad, good])
-        with net, mock.patch("time.sleep"):
+        with net, mock.patch("revapi.llm._sleep"):
             r = LLM(provider="openrouter", api_key="k").chat([{"role": "user", "content": "x"}], on_retry=lambda *a: None)
         self.assertEqual(r.content, "fine")
 
@@ -635,6 +635,188 @@ class Unit(unittest.TestCase):
 
 
 @unittest.skipUnless(HAS_CHROMIUM, "no chromium")
+class Port(unittest.TestCase):
+    """What came over from RAE in 0.3.0: the Hermes engine, efforts, update notice, the full-screen session."""
+
+    def _har(self) -> Path:
+        d = Path(tempfile.mkdtemp())
+        entry = {"startedDateTime": "2026-01-01T00:00:00Z", "time": 5, "timings": {}}
+        entry["request"] = {"method": "GET", "url": "http://x/api/todos", "headers": [], "queryString": [], "cookies": []}
+        entry["response"] = {
+            "status": 200,
+            "headers": [{"name": "content-type", "value": "application/json"}],
+            "content": {"mimeType": "application/json", "text": json.dumps({"items": []})},
+            "cookies": [],
+        }
+        har = {"log": {"version": "1.2", "entries": [entry]}}
+        (d / "x.har").write_text(json.dumps(har))
+        return d / "x.har"
+
+    def test_hermes_engine_engineers_and_resumes(self) -> None:
+        cfg = _cfg()
+        cfg.set("engine", "hermes")
+        cfg.set("hermes_model", "claude-sonnet-4-5")
+        fake = str(ROOT / "tests" / "fake_hermes.py")
+        events: list[tuple[str, dict]] = []
+
+        class Rec(Reporter):
+            def __call__(self, kind: str, data: dict) -> None:  # noqa: D102
+                events.append((kind, data))
+                super().__call__(kind, data)
+
+        with mock.patch.dict(os.environ, {"REVAPI_HERMES_BIN": fake}):
+            keep: dict = {}
+            res = modes.run_engineer(None, cfg, Rec(quiet=True), prompt="write it", har_file=self._har(), interactive=True, keep=keep)
+            self.assertIsNone(res["error"], res)
+            self.assertTrue(res["script_path"].endswith("api_client.py"), res)
+            self.assertGreater(res["usage"]["estimated_cost_usd"], 0)
+            kinds = [k for k, _ in events]
+            self.assertIn("tool_start", kinds)
+            self.assertIn("thinking", kinds)
+            rec = store.History().get(res["run_id"])
+            self.assertEqual(rec["hermes_session"], "sess-1")
+            sent = json.loads((Path(res["script_path"]).parent / "argv.json").read_text())
+            self.assertIn("--format", sent["argv"])
+            self.assertIn("claude-sonnet-4-5", sent["argv"])
+            self.assertIn("write it", sent["prompt"])
+            # a follow-up continues the same Hermes session
+            self.assertIsNotNone(keep.get("hermes"))
+            res2 = modes.follow_up(keep, "add pagination", Rec(quiet=True))
+            self.assertIsNone(res2["error"], res2)
+            sent = json.loads((Path(res["script_path"]).parent / "argv.json").read_text())
+            self.assertEqual(sent["argv"][sent["argv"].index("--resume") + 1], "sess-1")
+            # the transcript is in revapi's format, so /resume can replay it
+            msgs = [json.loads(ln) for ln in store.messages_path(res["run_id"]).read_text().splitlines() if ln.strip()]
+            self.assertTrue(any(m.get("tool_calls") for m in msgs))
+            # a failing turn reports Hermes' own error
+            res3 = modes.follow_up(keep, "FAIL now", Rec(quiet=True))
+            self.assertIn("no API key", res3["error"] or "")
+        # the agent mode needs the built-in engine
+        res4 = modes.run_agent("x", None, cfg, Reporter(quiet=True))
+        self.assertEqual(res4["error_kind"], "config")
+        with mock.patch.dict(os.environ, {"REVAPI_HERMES_BIN": "/nonexistent/hermes"}):
+            res5 = modes.run_engineer(None, cfg, Reporter(quiet=True), har_file=self._har())
+            self.assertIn("hermes CLI was not found", res5["error"])
+
+    def test_efforts_and_engine_config(self) -> None:
+        cfg = _cfg()
+        for e in ("low", "medium", "high", "xhigh", "max", None):
+            cfg.set("effort", e)
+        with self.assertRaises(ValueError):
+            cfg.set("effort", "turbo")
+        with self.assertRaises(ValueError):
+            cfg.set("engine", "nope")
+        self.assertEqual(llmmod.wire_effort("max"), "high")
+        llm = LLM(provider="openai", model="o4-mini", api_key="k", effort="xhigh")
+        body = llm._openai_body([{"role": "user", "content": "hi"}], None, False) if hasattr(llm, "_openai_body") else None
+        if body is not None:
+            self.assertEqual(body.get("reasoning_effort"), "high")
+        a = LLM(provider="anthropic", model="claude-sonnet-4-5", api_key="k", effort="max")
+        self.assertEqual(a._anthropic_body([{"role": "user", "content": "hi"}], None, False)["thinking"]["budget_tokens"], 48000)
+
+    def test_update_notice(self) -> None:
+        class R:
+            def __init__(self, tag: str) -> None:
+                self.tag = tag
+
+            def read(self) -> bytes:
+                return json.dumps({"tag_name": self.tag}).encode()
+
+            def __enter__(self):  # noqa: ANN204
+                return self
+
+            def __exit__(self, *a) -> None:  # noqa: ANN002
+                pass
+
+        cache = store.app_dir() / "update_check.json"
+        cache.unlink(missing_ok=True)
+        with mock.patch("urllib.request.urlopen", lambda *a, **k: R("v99.0.0")):
+            note = modes.update_notice(force=True)
+        self.assertIn("99.0.0", note or "")
+        with mock.patch("urllib.request.urlopen", lambda *a, **k: R("v0.0.1")):
+            self.assertIsNone(modes.update_notice(force=True))
+        with mock.patch("urllib.request.urlopen", side_effect=OSError("offline")):
+            self.assertIsNone(modes.update_notice(force=True))
+        with mock.patch.dict(os.environ, {"REVAPI_NO_UPDATE_CHECK": "1"}):
+            self.assertIsNone(modes.update_notice())
+
+    def test_session_keys_wrapping_and_commands(self) -> None:
+        from revapi import session as S
+
+        k = S.Keys()
+        evs = k.feed(b"hi\x1b[A\x1b[Z\x05\r\x1b[200~pa\nste\x1b[201~\x1b[<0;5;7M\x1b[5~\x7f")
+        self.assertEqual(evs[0], ("text", "hi"))
+        names = [e[1] for e in evs if e[0] == "key"]
+        self.assertEqual(names, ["up", "s-tab", "c-e", "enter", "pageup", "backspace"])
+        self.assertIn(("paste", "pa\nste"), evs)
+        self.assertIn(("mouse", 0, 5, 7, False), evs)
+        self.assertEqual(k.feed(b"\x1b"), [])  # a lone esc waits for more
+        self.assertEqual(k.parse(final=True), [("key", "esc")])
+        self.assertEqual(k.feed("é".encode()[:1]), [])  # half a character waits too
+        self.assertEqual(k.feed("é".encode()[1:]), [("text", "é")])
+        line = termmod.sty("x" * 30, termmod.PINK) + termmod.link("link", "https://example.com")
+        rows = S.hard_wrap(line, 12)
+        self.assertTrue(all(termmod.vis_len(r) <= 12 for r in rows))
+        self.assertEqual("".join(termmod.strip_ansi(r) for r in rows), "x" * 30 + "link")
+        spans = S.links_in("see https://a.b/c and /tmp/x/y.py")
+        self.assertEqual([u for _, _, u in spans], ["https://a.b/c", "/tmp/x/y.py"])
+        self.assertEqual(S.host_in("all jobs on jobs.ashbyhq.com/openai"), "jobs.ashbyhq.com")
+        self.assertEqual(S.user_words("<mission>get jobs</mission> rest"), "get jobs")
+        # the session works without a terminal: commands, pickers, settings, a run with a question
+        cfg = _cfg()
+        s = S.Session(cfg)
+        s.on_event(("text", "/mo"))
+        self.assertEqual([c for c, _ in s.palette_items()], ["/model", "/mode", "/models"])
+        s.on_event(("key", "down"))
+        s.on_event(("key", "enter"))  # /mode opens its picker
+        self.assertEqual(s.st.picker.title, "choose a mode")
+        s.on_event(("text", "3"))  # a number picks in a short list
+        self.assertEqual(s.st.mode, "engineer")
+        s.on_event(("key", "s-tab"))
+        self.assertEqual(s.st.mode, "collector")
+        s.on_event(("key", "c-e"))
+        self.assertEqual(cfg.get("effort"), "low")
+        s.run_command("/settings retries 7")
+        self.assertEqual(cfg.get("retries"), 7)
+        s.run_command("/effort max")
+        self.assertEqual(cfg.get("effort"), "max")
+        frame, row, col = s.compose(90, 30)
+        self.assertEqual(len(frame), 30)
+        self.assertIn("max", termmod.strip_ansi(frame[-1]))
+
+        def runner(prompt: str, rep: Reporter, keep: dict) -> dict:
+            rep("thinking", {"text": "planning the capture"})
+            answer = modes.terminal_ask("which site?", ["a.com", "b.com"])
+            rep("text", {"text": f"picked {answer}"})
+            return {"status": "ok", "error": None, "usage": {"estimated_cost_usd": 0.25}}
+
+        s.runners = {"collector": runner}
+        modes.terminal_ask, orig = s.ask, modes.terminal_ask
+        try:
+            s.submit("collect things")
+            for _ in range(200):
+                while s.calls:
+                    s.calls.popleft()()
+                if s.st.picker is not None and s.st.picker.question:
+                    break
+                import time as _t
+
+                _t.sleep(0.02)
+            self.assertTrue(s.st.picker.question)
+            s.on_event(("key", "down"))
+            s.on_event(("key", "enter"))
+            s.worker.join(5)
+            while s.calls:
+                s.calls.popleft()()
+        finally:
+            modes.terminal_ask = orig
+        text = "\n".join(termmod.strip_ansi(x) for x in s.transcript.full_lines())
+        self.assertIn("which site?", text)
+        self.assertIn("picked b.com", text)
+        self.assertFalse(s.st.running)
+        self.assertAlmostEqual(s.st.cost, 0.25)
+
+
 class BrowserAndPipelines(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:

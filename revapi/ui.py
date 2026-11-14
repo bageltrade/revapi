@@ -214,10 +214,14 @@ class Reporter:
                 self.stream.write(json.dumps({"event": event, **fields}, ensure_ascii=False, default=str) + "\n")
                 self.stream.flush()
 
-    def out(self, *lines: str) -> None:
+    def out(self, *lines: str, full: list[str] | None = None) -> None:
+        """Print lines. ``full`` is the unfolded version (all of the reasoning, the whole output), which the
+        full-screen session keeps for ctrl+o."""
         if self.quiet:
             return
-        if self.live:
+        if self.live is not None and hasattr(self.live, "add"):
+            self.live.add(list(lines), full)
+        elif self.live:
             self.live.print(*lines)
         else:
             print("\n".join(lines), file=sys.stderr, flush=True)
@@ -324,11 +328,13 @@ class Reporter:
             wrapped += T.wrap(p, w - 8)
         shown = wrapped if self.verbose else wrapped[:NOTE_LINES]
         bar = sty("┊", HAIRLINE)
-        lines = [f"      {bar} {sty(f'thought for {secs}s', DIM)}"]
-        lines += [f"      {bar} {sty(ln, DIM, italic=True)}" for ln in shown]
+        head = [f"      {bar} {sty(f'thought for {secs}s', DIM)}"]
+        lines = head + [f"      {bar} {sty(ln, DIM, italic=True)}" for ln in shown]
+        full = head + [f"      {bar} {sty(ln, DIM, italic=True)}" for ln in wrapped] + [""]
         if len(shown) < len(wrapped):
-            lines.append(f"      {bar} {sty(f'+{len(wrapped) - len(shown)} lines · /thinking shows all', DIM)}")
-        self.out(*lines, "")
+            how = "ctrl+o full output" if hasattr(self.live, "add") else "/thinking shows all"
+            lines.append(f"      {bar} {sty(f'+{len(wrapped) - len(shown)} lines · {how}', DIM)}")
+        self.out(*lines, "", full=full if len(shown) < len(wrapped) else None)
 
     # -- streamed text -----------------------------------------------------------------------------------
     def _md(self) -> T.Markdown:
@@ -410,9 +416,12 @@ class Reporter:
         out = []
         for i, ln in enumerate(shown, start):
             out.append(" " * INDENT + sty(f"{i:>{nw}} ", HAIRLINE) + T.truncate(T.highlight(ln.replace("\t", "    "), lang), w))
+        full = None
         if len(lines) > len(shown):
             out.append(" " * (INDENT + 2) + sty(f"+{len(lines) - len(shown)} lines · {len(lines)} total", DIM))
-        self.out(*out)
+            fw = len(str(len(lines)))
+            full = [" " * INDENT + sty(f"{i:>{fw}} ", HAIRLINE) + T.highlight(ln.replace("\t", "    "), lang) for i, ln in enumerate(lines, 1)]
+        self.out(*out, full=full)
 
     def _diff(self, old: str, new: str, lang: str) -> None:
         w = T.cols() - INDENT - 4
@@ -420,7 +429,7 @@ class Reporter:
         rows += [" " * INDENT + sty("+ ", MINT, bold=True) + T.truncate(T.highlight(x, lang), w) for x in new.splitlines()]
         cap = len(rows) if self.verbose else OUTPUT_PREVIEW * 2
         more = len(rows) - cap
-        self.out(*(rows[:cap] + ([" " * (INDENT + 2) + sty(f"+{more} lines", DIM)] if more > 0 else [])))
+        self.out(*(rows[:cap] + ([" " * (INDENT + 2) + sty(f"+{more} lines", DIM)] if more > 0 else [])), full=rows if more > 0 else None)
 
     def _receipt(self, name: str, output: str, is_error: bool) -> None:
         text = (output or "").strip()
@@ -442,9 +451,11 @@ class Reporter:
             ln = T.strip_ansi(ln)
             ln = ln if len(ln) <= room else ln[: room - 1] + "…"
             out.append(" " * INDENT + sty("└ " if i == 0 else "  ", HAIRLINE) + T.receipt_line(ln, PINK if is_error else DIM))
+        full = None
         if len(lines) > cap:
             out.append(" " * (INDENT + 2) + sty(f"+{len(lines) - cap} lines", DIM))
-        self.out(*out)
+            full = [" " * INDENT + sty("└ " if i == 0 else "  ", HAIRLINE) + T.receipt_line(T.strip_ansi(ln), PINK if is_error else DIM) for i, ln in enumerate(lines[:2000])]
+        self.out(*out, full=full)
 
     # -- events from the agent ------------------------------------------------------------------------
     def __call__(self, kind: str, data: dict[str, Any]) -> None:

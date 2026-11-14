@@ -13,8 +13,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from . import __version__, store
 from . import har as harlib
-from . import store
 from .agent import Agent
 from .browser import Browser, find_chromium, is_api_like
 from .llm import LLM, LLMError  # noqa: F401  (LLM re-exported for cli)
@@ -85,6 +85,17 @@ def ask_note(interactive: bool) -> str:
 
 
 # ----------------------------------------------------------------------------- helpers
+
+
+HERMES_AGENT_NOTE = (
+    "the hermes engine engineers saved captures only, so agent mode stops before opening a browser. "
+    "Capture with the built-in engine (revapi config set engine revapi), then switch back "
+    "(revapi config set engine hermes) and run: revapi engineer <run_id>"
+)
+
+
+def hermes_engine(cfg: store.Config) -> bool:
+    return (cfg.get("engine") or "revapi") == "hermes"
 
 
 def make_llm(cfg: store.Config, model: str | None = None, collector: bool = False) -> LLM:
@@ -178,6 +189,8 @@ def run_agent(
     keep: dict | None = None,
 ) -> dict:
     output_dir = output_dir or cfg.get("output_dir")
+    if hermes_engine(cfg):
+        return payload("agent", None, prompt, {"error": HERMES_AGENT_NOTE, "error_kind": "config"}, url=url)
     llm = make_llm(cfg, model)
     run_id = run_id or store.new_run_id()
     scripts = store.scripts_dir(run_id, output_dir)
@@ -252,7 +265,10 @@ def run_engineer(
             har = store.har_path(run_id, output_dir)
         if not har.exists():
             return payload("engineer", run_id, prompt, {"error": f"no HAR for run {run_id} at {har}", "error_kind": "not_found"})
-    llm = make_llm(cfg, model)
+    use_hermes = hermes_engine(cfg)
+    llm = None if use_hermes else make_llm(cfg, model)
+    label = f"hermes · {cfg.get('hermes_model') or 'default'}" if llm is None else llm.describe()
+    provider = "hermes" if llm is None else llm.provider
     scripts = store.scripts_dir(run_id, output_dir)
     cg = Codegen(cfg.get("output_language"), cfg.get("output_mode"), scripts)
     original = (rec or {}).get("prompt") or ""
@@ -263,12 +279,12 @@ def run_engineer(
         for p in scripts.iterdir():
             shutil.rmtree(p) if p.is_dir() else p.unlink()
     if not rec:
-        hist.upsert(store.make_record(run_id, "engineer", main_prompt or "(engineer HAR)", llm.describe(), None, output_dir, output_mode=cg.mode, output_language=cg.language, provider=llm.provider))
-    hist.update(run_id, status="running", model=llm.describe(), last_engineered=time.strftime("%Y-%m-%dT%H:%M:%S"))
-    rep.emit("run_started", run_id=run_id, mode="engineer", model=llm.describe(), har_path=str(har), scripts_dir=str(scripts))
+        hist.upsert(store.make_record(run_id, "engineer", main_prompt or "(engineer HAR)", label, None, output_dir, output_mode=cg.mode, output_language=cg.language, provider=provider))
+    hist.update(run_id, status="running", model=label, last_engineered=time.strftime("%Y-%m-%dT%H:%M:%S"))
+    rep.emit("run_started", run_id=run_id, mode="engineer", model=label, har_path=str(har), scripts_dir=str(scripts))
     n_entries = len(harlib.load(har))
     _setup_rep(rep, cfg, "engineer")
-    rep.run_header("engineer", run_id, llm.describe(), f"{n_entries} HAR entries")
+    rep.run_header("engineer", run_id, label, f"{n_entries} HAR entries")
     ctx = Context(workdir=scripts, har_path=har, interactive=interactive, shell_timeout=cfg.get("shell_timeout", 180), ask=terminal_ask)
     attempt = (
         ""
@@ -289,7 +305,9 @@ def run_engineer(
         quality_check="The completeness and accuracy of the OpenAPI spec" if cg.docs else "Whether the implementation works",
         output_type="spec" if cg.docs else "code",
         ask_user_note=ask_note(interactive),
-        tools_note="Tools: har_overview / har_search / har_entry to explore traffic; read_file / write_file / edit_file / list_dir for files; shell to install dependencies and run tests; web_fetch for public docs. Call `finish` with your final response when done.",
+        tools_note=HERMES_TOOLS_NOTE
+        if use_hermes
+        else "Tools: har_overview / har_search / har_entry to explore traffic; read_file / write_file / edit_file / list_dir for files; shell to install dependencies and run tests; web_fetch for public docs. Call `finish` with your final response when done.",
     )
     guidance = ""
     if existing:
@@ -312,6 +330,9 @@ def run_engineer(
         is_fresh=str(fresh).lower(),
         existing_artifact="documentation" if cg.docs else "script",
     )
+    if use_hermes:
+        return _engineer_hermes(cfg, rep, run_id, prompt, fresh, har, scripts, cg, system, user, main_prompt, output_dir, hist, keep)
+    assert llm is not None
     tools = har_tools(ctx) + file_tools(ctx) + [t for t in web_tools(ctx) if t.name == "web_fetch"] + control_tools(ctx)
     agent = Agent(llm, tools, ctx, system, store.messages_path(run_id, output_dir), rep, cfg.get("max_turns", 120), compact_at=float(os.environ.get("REVAPI_COMPACT_AT") or 0) or cfg.get("compact_at"))
     if keep is not None:
@@ -330,6 +351,77 @@ def run_engineer(
         rep.card(result["script_path"], llm.describe())
     rep.footer()
     return payload("engineer", run_id, prompt, result, fresh=fresh, har_path=str(har), local_path=str(syncer.dst) if syncer else None, model=llm.describe())
+
+
+HERMES_TOOLS_NOTE = (
+    "Use your own tools: the HAR file is JSON, so read it with your file and terminal tools (python -c / jq to list "
+    "entries, then print the ones that matter in full); write the files into the output directory; install "
+    "dependencies and run the client against the live site until it works. Finish with a short summary."
+)
+
+
+def _engineer_hermes(
+    cfg: store.Config,
+    rep: Reporter,
+    run_id: str,
+    prompt: str | None,
+    fresh: bool,
+    har: Path,
+    scripts: Path,
+    cg: Codegen,
+    system: str,
+    user: str,
+    main_prompt: str,
+    output_dir: str | None,
+    hist: store.History,
+    keep: dict | None,
+) -> dict:
+    """Engineer through the local Hermes CLI instead of the built-in agent."""
+    from .hermes import HermesRun, hermes_binary, missing_message
+
+    if hermes_binary() is None:
+        result = {"error": missing_message(), "error_kind": "config", "usage": {}}
+        _finish_record(hist, run_id, result)
+        return payload("engineer", run_id, prompt, result, fresh=fresh, har_path=str(har))
+    hr = HermesRun(
+        scripts,
+        rep,
+        model=cfg.get("hermes_model"),
+        provider=cfg.get("hermes_provider"),
+        max_turns=cfg.get("hermes_max_turns"),
+        log_path=store.messages_path(run_id, output_dir),
+        session_id=None if fresh else (hist.get(run_id) or {}).get("hermes_session"),
+    )
+    if keep is not None:
+        keep.update(hermes=hr, agent=None, ctx=None, run_id=run_id, mode="engineer", cg=cg, output_dir=output_dir)
+    syncer = _start_sync(cfg, scripts, main_prompt or run_id, rep)
+    try:
+        # A resumed Hermes session already holds the brief; it only gets the new instructions.
+        turn = (prompt or "Continue.") if hr.session_id else f"{system}\n\n{user}"
+        error = hr.turn(turn, shown_prompt=user if not hr.session_id else turn)
+    finally:
+        if syncer:
+            syncer.stop()
+    return _hermes_result(hr, rep, hist, run_id, prompt, cg, scripts, error, syncer, fresh=fresh, har=har)
+
+
+def _hermes_result(hr: Any, rep: Reporter, hist: store.History, run_id: str, prompt: str | None, cg: Codegen | None, scripts: Path, error: str | None, syncer: Any = None, **extra: Any) -> dict:
+    script = _main_script(scripts, cg) if cg else None
+    if not error and not script:
+        error = f"hermes finished without writing {cg.client_filename() if cg else 'the client'} in {scripts}"
+    result: dict[str, Any] = {"usage": hr.usage.as_dict(), "script_path": script, "turns": hr.usage.requests}
+    if error:
+        result.update(error=error, error_kind="engine_failure")
+    hist.update(run_id, hermes_session=hr.session_id)
+    paths = {"script_path": script, "local_path": str(syncer.dst) if syncer else None}
+    if extra.get("har"):
+        paths["har_path"] = str(extra["har"])
+    _finish_record(hist, run_id, result, {"paths": paths})
+    if not error:
+        rep.card(script, hr.label)
+    rep.footer()
+    har = extra.pop("har", None)
+    return payload("engineer", run_id, prompt, result, har_path=str(har) if har else None, local_path=str(syncer.dst) if syncer else None, model=hr.label, **extra)
 
 
 # ----------------------------------------------------------------------------- manual mode
@@ -659,8 +751,15 @@ def resume(run_id: str, cfg: store.Config, rep: Reporter, model: str | None = No
     mp = Path((rec.get("paths") or {}).get("messages_path") or store.messages_path(run_id, output_dir))
     if not mp.exists():
         raise ValueError(f"no transcript for {run_id}")
-    msgs = Agent.load_messages(mp)
     mode = rec.get("mode", "agent")
+    if rec.get("hermes_session") and hermes_engine(cfg):  # a Hermes conversation continues in Hermes
+        from .hermes import HermesRun
+
+        scripts = store.scripts_dir(run_id, output_dir)
+        hr = HermesRun(scripts, rep, cfg.get("hermes_model"), cfg.get("hermes_provider"), cfg.get("hermes_max_turns"), mp, rec["hermes_session"])
+        cg = Codegen(rec.get("output_language") or cfg.get("output_language"), rec.get("output_mode") or cfg.get("output_mode"), scripts)
+        return {"hermes": hr, "agent": None, "ctx": None, "run_id": run_id, "mode": "engineer", "cg": cg, "output_dir": output_dir}
+    msgs = Agent.load_messages(mp)
     scripts = store.scripts_dir(run_id, output_dir) if mode != "collector" else store.collected_dir(run_id, output_dir)
     ctx = Context(
         workdir=scripts,
@@ -690,6 +789,17 @@ def resume(run_id: str, cfg: store.Config, rep: Reporter, model: str | None = No
 
 def follow_up(keep: dict, text: str, rep: Reporter) -> dict:
     """Continue the last (or resumed) session with a new instruction."""
+    if keep.get("hermes") is not None:
+        hr = keep["hermes"]
+        hr.on_event = rep
+        rep.mode, rep.model = "engineer", hr.label
+        hist = store.History()
+        hist.update(keep["run_id"], status="running")
+        before = hr.usage.as_dict()
+        error = hr.turn(text)
+        res = _hermes_result(hr, rep, hist, keep["run_id"], text, keep.get("cg"), Path(hr.scripts_dir), error)
+        res["usage_turn"] = {k: (v or 0) - (before.get(k) or 0) for k, v in hr.usage.as_dict().items() if isinstance(v, (int, float))}
+        return res
     agent: Agent = keep["agent"]
     ctx: Context = keep["ctx"]
     ctx.finished = None
@@ -719,6 +829,40 @@ def follow_up(keep: dict, text: str, rep: Reporter) -> dict:
     return payload(keep["mode"], keep["run_id"], text, result)
 
 
+# ----------------------------------------------------------------------------- updates
+
+RELEASES_API = "https://api.github.com/repos/bageltrade/revapi/releases/latest"
+UPDATE_HINT = "cd ~/revapi && git pull && pip install ."
+
+
+def _vtuple(v: str) -> tuple[int, ...]:
+    return tuple(int(x) for x in re.findall(r"\d+", v)[:3])
+
+
+def update_notice(force: bool = False) -> str | None:
+    """A note when a newer revapi release exists. Checked at most once a day (cached); never raises."""
+    if os.environ.get("REVAPI_NO_UPDATE_CHECK") and not force:
+        return None
+    cache = store.app_dir() / "update_check.json"
+    latest = None
+    try:
+        data = json.loads(cache.read_text()) if cache.exists() else {}
+        if not force and time.time() - data.get("at", 0) < 86400:
+            latest = data.get("latest")
+        else:
+            import urllib.request
+
+            req = urllib.request.Request(RELEASES_API, headers={"User-Agent": "revapi", "Accept": "application/vnd.github+json"})
+            with urllib.request.urlopen(req, timeout=4) as r:
+                latest = json.loads(r.read().decode()).get("tag_name")
+            cache.write_text(json.dumps({"at": time.time(), "latest": latest}))
+    except Exception:  # noqa: BLE001  (offline, rate limited: no notice)
+        return None
+    if latest and _vtuple(latest) > _vtuple(__version__):
+        return f"revapi {latest.lstrip('v')} is out (you have {__version__}) · update: {UPDATE_HINT}"
+    return None
+
+
 # ----------------------------------------------------------------------------- doctor
 
 
@@ -740,6 +884,14 @@ def doctor(cfg: store.Config) -> list[tuple[str, bool, str]]:
         checks.append(("llm provider", True, llm.describe() + ("" if llm.api_key or llm.provider in ("pollinations", "ollama", "lmstudio") else " (no key)")))
     except LLMError as e:
         checks.append(("llm provider", False, str(e)))
+    from .hermes import hermes_binary, missing_message
+
+    hb = hermes_binary()
+    if hermes_engine(cfg):
+        checks.append(("engine: hermes", bool(hb), hb or missing_message()))
+    elif hb:
+        checks.append(("hermes cli (optional engine)", True, hb))
+    checks.append(("update", True, update_notice(force=True) or f"revapi {__version__} is the latest"))
     for tool in ("bash", "node", "go", "php", "ruby", "java", "dotnet", "cc", "pwsh"):
         p = shutil.which(tool)
         checks.append((f"runtime: {tool}", bool(p), p or "not installed (only needed for that output language)"))

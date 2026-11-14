@@ -34,12 +34,18 @@ pip install .                 # or run without installing: python -m revapi
 revapi doctor
 ```
 
+To update later (the session tells you when a new release is out):
+
+```bash
+cd ~/revapi && git pull && pip install .
+```
+
 Or install straight from GitHub without cloning:
 
 ```bash
 pip install git+https://github.com/bageltrade/revapi.git
 # or a release wheel:
-pip install https://github.com/bageltrade/revapi/releases/download/v0.1.2/revapi-0.1.2-py3-none-any.whl
+pip install https://github.com/bageltrade/revapi/releases/download/v0.3.0/revapi-0.3.0-py3-none-any.whl
 ```
 
 ### Linux / macOS / WSL
@@ -132,18 +138,38 @@ revapi config set output_mode docs             # OpenAPI 3.0 spec + README inste
 
 ### Interactive session
 
-Run `revapi` with no arguments. Type a request; if it contains a URL, that becomes the start page. Follow-up messages keep refining the same run.
+Run `revapi` with no arguments to open the full-screen session, ported from the original's. The conversation scrolls above an input bar fixed to the bottom, and the session is plain Python stdlib, so it runs the same in Termux. Type a request; if it contains a URL, that becomes the start page. Follow-up messages keep refining the same run.
+
+- Type `/` for the command menu. It narrows as you type; ↑↓ move, tab completes, enter runs.
+- Pickers (arrow keys, a tap, or a number) for `/model` (loaded from the provider; type to search), `/effort`, `/mode`, `/language`, `/settings`, `/history` and `/resume`.
+- Type while a run works and enter queues the prompt. When the agent asks a question, its options appear as a list with a "something else" choice.
+- `/resume` redraws the past conversation as it looked live, then continues it.
+- Click a path or URL to open it (`termux-open` on Android). Drag over text to copy it (Termux:API `termux-clipboard-set`, pbcopy, wl-copy, xclip, or OSC 52 over SSH).
+- On exit, the session is printed into your terminal's scrollback.
+- `REVAPI_CLASSIC=1` gives you the old line-by-line prompt instead.
+
+| Key | Does |
+|---|---|
+| enter | Send (or answer the run waiting for a follow-up) |
+| esc | Stop the run · close a list |
+| shift+tab | Next mode |
+| ctrl+e | Next effort |
+| ctrl+o | Everything from this session, unfolded, in a pager |
+| ↑ ↓ | Earlier prompts · move in a list |
+| pageup / pagedown / wheel | Scroll · end jumps back to the latest |
+| ctrl+c | Stop the run · clear the bar · quit |
+| ctrl+d | Quit |
 
 | Command | Does |
 |---|---|
 | `/mode` | Switch mode: agent, manual, engineer or collector |
 | `/model` | Change model; `/model nvidia:stepfun-ai/step-5-preview` switches provider too |
 | `/models` | List the models available on the current provider (`/models flash` filters) |
-| `/effort` | Reasoning effort: low, medium, high or none |
+| `/effort` | Reasoning effort: low, medium, high, xhigh, max or none |
 | `/language` | Output language |
 | `/docs` | Toggle OpenAPI docs output |
 | `/settings` | Show settings; `/settings <key> <value>` changes one |
-| `/history` | List past runs |
+| `/history` | Past runs: details, then resume, re-engineer or run |
 | `/resume` | `/resume <id>` reopens a past conversation so you can continue it |
 | `/engineer` | `/engineer <id> [instructions]` re-engineers a past run |
 | `/run` | Run the latest client |
@@ -151,13 +177,12 @@ Run `revapi` with no arguments. Type a request; if it contains a URL, that becom
 | `/thinking` | The model's full reasoning from the last reply |
 | `/context` | How full the context window is (gauge, compactions, live messages) |
 | `/compact` | Summarize the conversation now; the full history stays recallable |
-| `/output` | Show everything from this session |
+| `/output` | Everything from this session, unfolded (also ctrl+o) |
 | `/new` | Start a new run |
 | `/clear` | Clear the session and start over |
 | `/help` | Help |
 | `/exit` | Quit |
 
-Ctrl-C interrupts the agent; Ctrl-D quits.
 
 ### What you see
 
@@ -251,7 +276,7 @@ While the agent works, a live status line shows a split-flap verb (*reading*, *w
 | `provider` | `auto` | anthropic, openai, openrouter, gemini, nvidia, groq, deepseek, mistral, xai, together, cerebras, opencode, ollama, lmstudio, pollinations or custom |
 | `model` | provider default | Model id |
 | `api_key` / `base_url` | – | Optional overrides; environment variables are preferred for keys |
-| `effort` | – | low, medium or high (reasoning effort / thinking budget) |
+| `effort` | – | low, medium, high, xhigh or max. Anthropic gets thinking budgets of 2k/8k/24k/32k/48k; OpenAI-style APIs get `reasoning_effort`, with xhigh and max sent as high |
 | `collector_model` | – | Separate model for collector mode |
 | `output_language` | `python` | Language of the generated client |
 | `output_mode` | `client` | `client` or `docs` |
@@ -268,6 +293,21 @@ While the agent works, a live status line shows a split-flap verb (*reading*, *w
 | `compact_at` | `0.8` | Compact when context reaches this share of the window (0.3–0.95) |
 | `show_thinking` | `true` | Show the model's reasoning as folded ┊ notes |
 | `max_tokens` | `16000` | Maximum reply length |
+| `engine` | `revapi` | `revapi` (the built-in agent, any provider) or `hermes` (engineer and manual modes run through the local Hermes CLI) |
+| `hermes_model` / `hermes_provider` | – | Passed to Hermes as `-m` / `--provider`; empty uses Hermes' own config |
+| `hermes_max_turns` | – | Passed to Hermes as `--max-turns` |
+
+### Hermes engine
+
+As in the original, engineering can run through [Hermes Agent](https://hermes-agent.nousresearch.com) instead of the built-in agent:
+
+```bash
+curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash   # Hermes v2026.9.21 or later
+revapi config set engine hermes
+revapi engineer <run_id>        # or /settings → engine in the session
+```
+
+revapi runs `hermes chat --format stream-json` with the HAR in the workspace and streams its reasoning and tool calls into the same ledger. It saves the Hermes session id, so follow-ups and `/resume` continue the same conversation, and it logs the transcript in revapi's format. Agent and collector modes need the built-in engine because they drive revapi's Chromium. `REVAPI_HERMES_BIN` points at a hermes binary outside PATH.
 
 ### Environment variables
 
@@ -285,6 +325,11 @@ While the agent works, a live status line shows a split-flap verb (*reading*, *w
 | `REVAPI_NO_LIVE=1` | No live status line (plain scrolling output) |
 | `REVAPI_NO_LINKS=1` | No clickable terminal hyperlinks |
 | `NO_COLOR=1` / `REVAPI_NO_COLOR=1` | Disable colored output |
+| `REVAPI_DEBUG=1` | Show tracebacks for unexpected errors |
+| `REVAPI_CLASSIC=1` | Use the line-by-line prompt instead of the full-screen session |
+| `REVAPI_NO_MOUSE=1` | Don't capture the mouse in the session (the terminal's own selection works) |
+| `REVAPI_NO_UPDATE_CHECK=1` | Skip the daily check for a newer release |
+| `REVAPI_HERMES_BIN` | Path to the hermes CLI |
 
 ## JSON output (for scripts and other agents)
 
@@ -320,7 +365,9 @@ The test suite:
 | `term.py` | Palette, styling, syntax highlighting, streaming Markdown renderer, live status line |
 | `ui.py` | The reporter: ledger lines, receipts, code previews, diffs, thinking notes, card |
 | `tools.py` | All agent tools |
-| `modes.py` | agent, engineer, manual, collector, run and doctor |
+| `modes.py` | agent, engineer, manual, collector, run, doctor and update check |
 | `store.py` | Config, run paths, history, script discovery, live sync |
-| `cli.py` | argparse CLI and interactive session |
+| `cli.py` | argparse CLI and line-by-line prompt |
+| `session.py` | Full-screen session: input bar, command menu, pickers, queue, questions, mouse, clipboard, pager |
+| `hermes.py` | Hermes CLI engine (stream-json events → the ledger, session resume, pricing) |
 | `prompts/` | Prompt templates and per-language code-generation partials |

@@ -39,6 +39,23 @@ class Tool:
         return {"name": self.name, "description": self.description, "parameters": self.parameters}
 
 
+def _kill_group(p: subprocess.Popen) -> None:
+    """Stop a shell command and everything it started."""
+    import signal
+
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        if p.poll() is not None:
+            return
+        try:
+            os.killpg(p.pid, sig)
+        except (OSError, AttributeError):
+            p.kill()
+        try:
+            p.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            continue
+
+
 def _obj(props: dict[str, Any] | None = None, required: list[str] | None = None) -> dict[str, Any]:
     return {"type": "object", "properties": props or {}, "required": required or []}
 
@@ -151,7 +168,9 @@ def browser_tools(ctx: Context) -> list[Tool]:
     def wait_for(text: str = "", seconds: float = 0) -> str:
         if text:
             return b().wait_for_text(text, timeout=seconds or 15)
-        time.sleep(min(seconds or 2, 60))
+        end = time.time() + min(seconds or 2, 60)
+        while time.time() < end:  # short slices: a stop lands at once
+            time.sleep(min(0.2, max(0.0, end - time.time())))
         b().wait_idle()
         return f"waited {seconds or 2}s"
 
@@ -335,13 +354,24 @@ def file_tools(ctx: Context) -> list[Tool]:
         sh = shutil.which("bash") or shutil.which("sh") or "/system/bin/sh"
         t = min(timeout or ctx.shell_timeout, 1800)
         env = {**os.environ, "PYTHONUNBUFFERED": "1", "PIP_DISABLE_PIP_VERSION_CHECK": "1"}
+        # Polled in short slices so a stop (esc in the session, ctrl-c) ends the command at once, process group and all.
+        p = subprocess.Popen([sh, "-c", command], cwd=ctx.workdir, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, stdin=subprocess.DEVNULL, start_new_session=True)
+        deadline = time.time() + t
         try:
-            r = subprocess.run([sh, "-c", command], cwd=ctx.workdir, capture_output=True, text=True, timeout=t, env=env, stdin=subprocess.DEVNULL)
-        except subprocess.TimeoutExpired as e:
-            out = (e.stdout or b"").decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
-            return _clip(f"[timed out after {t}s]\n{out}")
-        out = r.stdout + (("\n[stderr]\n" + r.stderr) if r.stderr.strip() else "")
-        return _clip(f"[exit {r.returncode}]\n{out}".rstrip())
+            while True:
+                try:
+                    stdout, stderr = p.communicate(timeout=0.25)
+                    break
+                except subprocess.TimeoutExpired:
+                    if time.time() > deadline:
+                        _kill_group(p)
+                        stdout, _ = p.communicate()
+                        return _clip(f"[timed out after {t}s]\n{stdout or ''}")
+        except BaseException:
+            _kill_group(p)
+            raise
+        out = (stdout or "") + (("\n[stderr]\n" + stderr) if (stderr or "").strip() else "")
+        return _clip(f"[exit {p.returncode}]\n{out}".rstrip())
 
     return [
         Tool("read_file", "Read a text file (relative paths are in the output directory). Returns numbered lines.", _obj({"path": S, "offset": I, "limit": I}, ["path"]), read_file),

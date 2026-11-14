@@ -22,6 +22,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
 LANGUAGES = {
     "python": ".py",
     "javascript": ".js",
@@ -53,7 +54,7 @@ DEFAULTS: dict[str, Any] = {
     "model": None,  # None -> provider default
     "api_key": None,  # optional; env vars are preferred
     "base_url": None,  # for provider=custom / self-hosted
-    "effort": None,  # low | medium | high
+    "effort": None,  # low | medium | high | xhigh | max
     "collector_model": None,
     "output_language": "python",
     "output_mode": "client",  # client | docs
@@ -70,6 +71,10 @@ DEFAULTS: dict[str, Any] = {
     "compact_at": 0.8,  # compact the conversation when it fills this share of the context window
     "show_thinking": True,  # show the model's reasoning (folded) in the margin
     "max_tokens": 16000,  # output tokens per reply (lowered automatically if a model caps it)
+    "engine": "revapi",  # revapi (built-in agent) | hermes (the local Hermes CLI engineers saved captures)
+    "hermes_model": None,  # None -> the model your Hermes config selects
+    "hermes_provider": None,  # None -> the provider your Hermes config selects
+    "hermes_max_turns": None,  # None -> the turn cap from your Hermes config
 }
 
 
@@ -104,6 +109,10 @@ class Config:
                 value = int(value)
         if key == "output_language" and value not in LANGUAGES:
             raise ValueError(f"output_language must be one of {', '.join(LANGUAGES)}")
+        if key == "engine" and value not in ("revapi", "hermes"):
+            raise ValueError("engine must be revapi or hermes")
+        if key == "hermes_max_turns" and value is not None and (not isinstance(value, int) or value < 1):
+            raise ValueError("hermes_max_turns must be a positive integer (or none)")
         if key == "output_mode" and value not in ("client", "docs"):
             raise ValueError("output_mode must be client or docs")
         if key == "compact_at" and value is not None:
@@ -112,8 +121,8 @@ class Config:
                 raise ValueError("compact_at must be between 0.3 and 0.95")
         if key in ("retries", "context_window", "max_tokens") and value is not None and (not isinstance(value, int) or value < 1):
             raise ValueError(f"{key} must be a positive integer")
-        if key == "effort" and value not in (None, "low", "medium", "high"):
-            raise ValueError("effort must be low, medium, high or none")
+        if key == "effort" and value not in (None, *EFFORTS):
+            raise ValueError("effort must be " + ", ".join(EFFORTS) + " or none")
         self.data[key] = value
         self.save()
 

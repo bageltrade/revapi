@@ -96,6 +96,8 @@ def cmd_agent(args: argparse.Namespace, cfg: store.Config) -> int:
 
 def dry_run(cfg: store.Config, args: argparse.Namespace, url: str | None, headless: bool | None) -> dict:
     checks = []
+    if modes.hermes_engine(cfg):  # like RAE: agent mode cannot run on the hermes engine
+        checks.append({"name": "engine", "ok": False, "detail": modes.HERMES_AGENT_NOTE})
     exe = find_chromium()
     checks.append({"name": "chromium", "ok": bool(exe), "detail": exe or "not found"})
     try:
@@ -331,7 +333,7 @@ REPL_COMMANDS = {
     "/new": "start a new capture",
     "/model": "choose the model (/model <name>, /model provider:<name>)",
     "/models": "list models available on the current provider (/models <filter>)",
-    "/effort": "how hard the agent thinks (low|medium|high|none)",
+    "/effort": "how hard the agent thinks (low|medium|high|xhigh|max|none)",
     "/mode": "choose the mode (agent|manual|engineer|collector)",
     "/language": "output language (python, javascript, typescript, go, java, csharp, php, ruby, c, powershell)",
     "/docs": "toggle OpenAPI docs output instead of a client",
@@ -419,6 +421,9 @@ def repl(cfg: store.Config) -> int:
     except LLMError as e:
         desc = f"no model ({e})"
     _banner(cfg, mode, desc)
+    note = modes.update_notice()
+    if note:
+        print(dim(f"   {note}"), file=sys.stderr)
     while True:
         try:
             short = (modes.make_llm(cfg).model if not desc.startswith("no model") else "no model").split("/")[-1]
@@ -472,7 +477,7 @@ def repl(cfg: store.Config) -> int:
                 cmd_models(argparse.Namespace(provider=None, filter=arg or None, all=False, json=False), cfg)
             elif cmd == "/effort":
                 try:
-                    cfg.set("effort", arg or _pick("effort", ["low", "medium", "high", "none"], cfg.get("effort") or "none"))
+                    cfg.set("effort", arg or _pick("effort", [*store.EFFORTS, "none"], cfg.get("effort") or "none"))
                     print(f"effort → {cfg.get('effort')}")
                 except ValueError as e:
                     print(red(str(e)))
@@ -755,12 +760,22 @@ def main(argv: list[str] | None = None) -> int:
         if not sys.stdin.isatty():
             parser.print_help()
             return 0
+        from . import session
+
+        if session.available():
+            return session.run(cfg)
         return repl(cfg)
     try:
         return handlers[args.cmd](args, cfg)
     except KeyboardInterrupt:
         print(red("\ninterrupted"), file=sys.stderr)
         return 130
+    except Exception as e:  # noqa: BLE001  (a short error; REVAPI_DEBUG=1 shows the traceback)
+        if os.environ.get("REVAPI_DEBUG"):
+            raise
+        print(red(f"error: {type(e).__name__}: {e}"), file=sys.stderr)
+        print(dim("   set REVAPI_DEBUG=1 for the traceback"), file=sys.stderr)
+        return 1
 
 
 def entry() -> None:
