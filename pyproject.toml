@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "revapi"
+version = "0.1.0"
+description = "Reverse engineer website APIs: headless Chromium capture + AI agent that writes working clients. Pure Python stdlib, runs on Termux."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = []
+
+[project.scripts]
+revapi = "revapi.cli:entry"
+
+[tool.setuptools]
+packages = ["revapi", "revapi.prompts"]
+
+[tool.setuptools.package-data]
+"revapi.prompts" = ["*.md", "partials/*.md"]
+
+[tool.ruff]
+line-length = 200
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B"]
+ignore = ["E501", "E731", "E741", "B008", "B023"]
