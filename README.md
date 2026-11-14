@@ -34,7 +34,7 @@ revapi doctor
 Or install a release wheel directly (download it from the repo's Releases page first):
 
 ```bash
-pip install revapi-0.1.1-py3-none-any.whl
+pip install revapi-0.1.2-py3-none-any.whl
 ```
 
 ### Linux / macOS / WSL
@@ -60,12 +60,12 @@ export ANTHROPIC_API_KEY=...     # or OPENAI_API_KEY, OPENROUTER_API_KEY, GEMINI
 
 ```bash
 export NVIDIA_API_KEY=nvapi-...          # get one at https://build.nvidia.com (keys start with nvapi-)
-revapi doctor                            # → llm provider  nvidia/moonshotai/kimi-k2.6
+revapi doctor                            # → llm provider  nvidia/stepfun-ai/step-5-preview
 revapi models                            # browse NVIDIA's catalog
 revapi config set model deepseek-ai/deepseek-v4.1-flash   # optional: pick another model
 ```
 
-The default is `moonshotai/kimi-k2.6` (strong at agentic coding and tool use). Other good picks are `deepseek-ai/deepseek-v4.1-flash`, `z-ai/glm-5.3-flash`, `minimaxai/minimax-m3.1-flash`, `nvidia/nemotron-3-super-120b-a12b` and `mistralai/mistral-large-4-1t-a52b`. You can also save the key in config instead of the environment: `revapi config set api_key nvapi-...` (an `nvapi-` key auto-selects NVIDIA).
+The default is `stepfun-ai/step-5-preview`. Other good picks are `moonshotai/kimi-k2.6` (strong at agentic coding and tool use), `deepseek-ai/deepseek-v4.1-flash`, `z-ai/glm-5.3-flash`, `minimaxai/minimax-m3.1-flash`, `nvidia/nemotron-3-super-120b-a12b` and `mistralai/mistral-large-4-1t-a52b`. You can also save the key in config instead of the environment: `revapi config set api_key nvapi-...` (an `nvapi-` key auto-selects NVIDIA).
 
 You can also choose explicitly:
 
@@ -132,7 +132,7 @@ Run `revapi` with no arguments. Type a request; if it contains a URL, that becom
 | Command | Does |
 |---|---|
 | `/mode` | Switch mode: agent, manual, engineer or collector |
-| `/model` | Change model; `/model nvidia:moonshotai/kimi-k2.6` switches provider too |
+| `/model` | Change model; `/model nvidia:stepfun-ai/step-5-preview` switches provider too |
 | `/models` | List the models available on the current provider (`/models flash` filters) |
 | `/effort` | Reasoning effort: low, medium, high or none |
 | `/language` | Output language |

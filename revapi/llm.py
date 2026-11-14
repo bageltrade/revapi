@@ -29,7 +29,7 @@ PROVIDERS: dict[str, tuple[str, str | None, str]] = {
     "together": ("https://api.together.xyz/v1", "TOGETHER_API_KEY", "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8"),
     "cerebras": ("https://api.cerebras.ai/v1", "CEREBRAS_API_KEY", "gpt-oss-120b"),
     "opencode": ("https://opencode.ai/zen/v1", "OPENCODE_API_KEY", "big-pickle"),
-    "nvidia": ("https://integrate.api.nvidia.com/v1", "NVIDIA_API_KEY", "moonshotai/kimi-k2.6"),  # NVIDIA NIM (build.nvidia.com), keys start with nvapi-
+    "nvidia": ("https://integrate.api.nvidia.com/v1", "NVIDIA_API_KEY", "stepfun-ai/step-5-preview"),  # NVIDIA NIM (build.nvidia.com), keys start with nvapi-
     "ollama": ("http://127.0.0.1:11434/v1", None, "qwen2.5-coder:7b"),
     "lmstudio": ("http://127.0.0.1:1234/v1", None, "local-model"),
     "pollinations": ("https://text.pollinations.ai/openai", "POLLINATIONS_TOKEN", "openai"),  # free, no key needed

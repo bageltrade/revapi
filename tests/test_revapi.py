@@ -152,7 +152,7 @@ class Unit(unittest.TestCase):
                 os.environ.pop(k, None)
             self.assertEqual(llmmod.detect_provider(), "nvidia")
             llm = LLM()
-            self.assertEqual((llm.provider, llm.model, llm.base_url), ("nvidia", "moonshotai/kimi-k2.6", "https://integrate.api.nvidia.com/v1"))
+            self.assertEqual((llm.provider, llm.model, llm.base_url), ("nvidia", "stepfun-ai/step-5-preview", "https://integrate.api.nvidia.com/v1"))
         self.assertEqual(LLM(api_key="nvapi-abc").provider, "nvidia")  # key prefix picks the provider
         calls = []
 
