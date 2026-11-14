@@ -17,7 +17,7 @@ from . import har as harlib
 from . import store
 from .agent import Agent
 from .browser import Browser, find_chromium, is_api_like
-from .llm import LLM, LLMError
+from .llm import LLM, LLMError  # noqa: F401  (LLM re-exported for cli)
 from .prompts import load
 from .tools import Context, browser_tools, collector_tools, control_tools, file_tools, har_tools, web_tools
 from .ui import Reporter, bold, cyan, dim, green, red, yellow

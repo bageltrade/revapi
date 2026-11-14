@@ -6,7 +6,7 @@ Turn any website into a working API client from your terminal (including **Termu
 
 - **Pure Python standard library.** No pip dependencies, no Playwright, no Node.
 - **Talks to Chromium directly** over the DevTools Protocol, using its own small WebSocket client.
-- **Works with almost any LLM.** Anthropic, OpenAI, OpenRouter, Gemini, Groq, DeepSeek, Mistral, xAI, Together, Cerebras and OpenCode are supported. So are local models through Ollama or LM Studio, any OpenAI-compatible URL, and a free keyless fallback.
+- **Works with almost any LLM.** Anthropic, OpenAI, OpenRouter, Gemini, **NVIDIA NIM**, Groq, DeepSeek, Mistral, xAI, Together, Cerebras and OpenCode are supported. So are local models through Ollama or LM Studio, any OpenAI-compatible URL, and a free keyless fallback.
 
 revapi is a from-scratch rebuild of [reverse-api-engineer](https://github.com/kalil0321/reverse-api-engineer) (MIT) with the same modes, commands and outputs. Its code-generation prompt partials are adapted from that project.
 
@@ -34,7 +34,7 @@ revapi doctor
 Or install a release wheel directly (download it from the repo's Releases page first):
 
 ```bash
-pip install revapi-0.1.0-py3-none-any.whl
+pip install revapi-0.1.1-py3-none-any.whl
 ```
 
 ### Linux / macOS / WSL
@@ -55,6 +55,17 @@ Export one key and revapi picks the matching provider automatically (`provider: 
 export ANTHROPIC_API_KEY=...     # or OPENAI_API_KEY, OPENROUTER_API_KEY, GEMINI_API_KEY,
                                  # GROQ_API_KEY, DEEPSEEK_API_KEY, MISTRAL_API_KEY, XAI_API_KEY ...
 ```
+
+#### NVIDIA (build.nvidia.com)
+
+```bash
+export NVIDIA_API_KEY=nvapi-...          # get one at https://build.nvidia.com (keys start with nvapi-)
+revapi doctor                            # → llm provider  nvidia/moonshotai/kimi-k2.6
+revapi models                            # browse NVIDIA's catalog
+revapi config set model deepseek-ai/deepseek-v4.1-flash   # optional: pick another model
+```
+
+The default is `moonshotai/kimi-k2.6` (strong at agentic coding and tool use). Other good picks are `deepseek-ai/deepseek-v4.1-flash`, `z-ai/glm-5.3-flash`, `minimaxai/minimax-m3.1-flash`, `nvidia/nemotron-3-super-120b-a12b` and `mistralai/mistral-large-4-1t-a52b`. You can also save the key in config instead of the environment: `revapi config set api_key nvapi-...` (an `nvapi-` key auto-selects NVIDIA).
 
 You can also choose explicitly:
 
@@ -102,6 +113,7 @@ revapi list [--json] [--full] [-n 10] [-m agent] [--model claude] [-s search]
 revapi show <run_id|latest> [--json]
 revapi run <run_id|latest> [-f file] [--ls] [--auto-install] [--json] [-- script args...]
 revapi har <run_id|file.har> [--search token] [--entry 12] [--all] [--api-only out.har]
+revapi models [-f filter] [--provider nvidia] [--json]   # list models on the provider
 revapi config [list | get k | set k v | unset k | path]
 revapi doctor
 ```
@@ -120,7 +132,8 @@ Run `revapi` with no arguments. Type a request; if it contains a URL, that becom
 | Command | Does |
 |---|---|
 | `/mode` | Switch mode: agent, manual, engineer or collector |
-| `/model` | Change model; `/model openrouter:qwen/qwen3-coder` switches provider too |
+| `/model` | Change model; `/model nvidia:moonshotai/kimi-k2.6` switches provider too |
+| `/models` | List the models available on the current provider (`/models flash` filters) |
 | `/effort` | Reasoning effort: low, medium, high or none |
 | `/language` | Output language |
 | `/docs` | Toggle OpenAPI docs output |
@@ -187,7 +200,7 @@ Ctrl-C interrupts the agent; Ctrl-D quits.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `provider` | `auto` | anthropic, openai, openrouter, gemini, groq, deepseek, mistral, xai, together, cerebras, opencode, ollama, lmstudio, pollinations or custom |
+| `provider` | `auto` | anthropic, openai, openrouter, gemini, nvidia, groq, deepseek, mistral, xai, together, cerebras, opencode, ollama, lmstudio, pollinations or custom |
 | `model` | provider default | Model id |
 | `api_key` / `base_url` | – | Optional overrides; environment variables are preferred for keys |
 | `effort` | – | low, medium or high (reasoning effort / thinking budget) |

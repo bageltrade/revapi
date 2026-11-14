@@ -278,6 +278,29 @@ def cmd_doctor(args: argparse.Namespace, cfg: store.Config) -> int:
     return 0 if ok_all else 1
 
 
+SKIP_MODELS = ("embed", "guard", "rerank", "safety", "reward", "retriev", "ocr", "whisper", "tts", "dall-e", "image", "audio", "moderation")
+
+
+def cmd_models(args: argparse.Namespace, cfg: store.Config) -> int:
+    try:
+        llm = modes.make_llm(cfg) if not args.provider else modes.LLM(provider=args.provider, api_key=cfg.get("api_key") if cfg.get("provider") == args.provider else None, require_key=False)
+        ids = llm.list_models()
+    except (LLMError, OSError, ValueError) as e:
+        print(red(f"could not list models: {e}"))
+        return 1
+    if not args.all:
+        ids = [i for i in ids if not any(k in i.lower() for k in SKIP_MODELS)]
+    if args.filter:
+        ids = [i for i in ids if args.filter.lower() in i.lower()]
+    if args.json:
+        _out({"provider": llm.provider, "current": llm.model, "models": ids})
+        return 0
+    for i in ids:
+        print(f"{green('●') if i == llm.model else ' '} {i}")
+    print(dim(f"\n{len(ids)} models on {llm.provider} · current: {llm.model} · change: revapi config set model <id>"))
+    return 0
+
+
 def cmd_har(args: argparse.Namespace, cfg: store.Config) -> int:
     p = Path(args.target)
     if not p.exists():
@@ -303,6 +326,7 @@ def cmd_har(args: argparse.Namespace, cfg: store.Config) -> int:
 REPL_COMMANDS = {
     "/new": "start a new capture",
     "/model": "choose the model (/model <name>, /model provider:<name>)",
+    "/models": "list models available on the current provider (/models <filter>)",
     "/effort": "how hard the agent thinks (low|medium|high|none)",
     "/mode": "choose the mode (agent|manual|engineer|collector)",
     "/language": "output language (python, javascript, typescript, go, java, csharp, php, ruby, c, powershell)",
@@ -405,6 +429,8 @@ def repl(cfg: store.Config) -> int:
                         cfg.set("model", arg)
                     keep = {}
                     print(f"model → {cfg.get('provider')}/{cfg.get('model') or 'default'}")
+            elif cmd == "/models":
+                cmd_models(argparse.Namespace(provider=None, filter=arg or None, all=False, json=False), cfg)
             elif cmd == "/effort":
                 try:
                     cfg.set("effort", arg or _pick("effort", ["low", "medium", "high", "none"], cfg.get("effort") or "none"))
@@ -607,6 +633,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("doctor", help="check Chromium, model provider and runtimes")
 
+    mo = sub.add_parser("models", help="list models available from the current (or given) provider")
+    mo.add_argument("--provider", choices=list(PROVIDERS))
+    mo.add_argument("-f", "--filter")
+    mo.add_argument("--all", action="store_true", help="include embedding/guard/etc. models")
+    mo.add_argument("--json", action="store_true")
+
     h = sub.add_parser("har", help="inspect a HAR (run id or file)")
     h.add_argument("target")
     h.add_argument("--entry", type=int)
@@ -638,6 +670,7 @@ def main(argv: list[str] | None = None) -> int:
         "config": cmd_config,
         "doctor": cmd_doctor,
         "har": cmd_har,
+        "models": cmd_models,
     }
     if not args.cmd:
         if not sys.stdin.isatty():

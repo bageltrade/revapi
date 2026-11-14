@@ -146,6 +146,29 @@ class Unit(unittest.TestCase):
         with self.assertRaises(llmmod.LLMError):
             LLM(provider="nope")
 
+    def test_nvidia_provider(self) -> None:
+        with mock.patch.dict(os.environ, {"NVIDIA_API_KEY": "nvapi-x"}, clear=False):
+            for k in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"):
+                os.environ.pop(k, None)
+            self.assertEqual(llmmod.detect_provider(), "nvidia")
+            llm = LLM()
+            self.assertEqual((llm.provider, llm.model, llm.base_url), ("nvidia", "moonshotai/kimi-k2.6", "https://integrate.api.nvidia.com/v1"))
+        self.assertEqual(LLM(api_key="nvapi-abc").provider, "nvidia")  # key prefix picks the provider
+        calls = []
+
+        def fake_post(url, body, headers, timeout):  # noqa: ANN001
+            calls.append((url, body, headers))
+            if len(calls) == 1:
+                raise llmmod.LLMError('HTTP 400: {"detail":"max_tokens must be <= 8192"}')
+            return {"choices": [{"message": {"content": "ok", "reasoning_content": "think"}}], "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+
+        with mock.patch.object(llmmod, "_post", fake_post):
+            r = LLM(provider="nvidia", api_key="nvapi-k").chat([{"role": "user", "content": "hi"}])
+        self.assertEqual((r.content, r.reasoning), ("ok", "think"))
+        self.assertEqual(calls[0][0], "https://integrate.api.nvidia.com/v1/chat/completions")
+        self.assertEqual(calls[0][2]["Authorization"], "Bearer nvapi-k")
+        self.assertEqual(calls[1][1]["max_tokens"], 4096)  # retried with a smaller output cap
+
     def test_openai_and_anthropic_wire_format(self) -> None:
         calls = []
 

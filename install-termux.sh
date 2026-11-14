@@ -16,5 +16,5 @@ pip install requests
 echo
 revapi doctor || true
 echo
-echo "[revapi] done. Set a model key, e.g.:  export ANTHROPIC_API_KEY=...   (or OPENROUTER_API_KEY, GEMINI_API_KEY, …)"
+echo "[revapi] done. Set a model key, e.g.:  export NVIDIA_API_KEY=nvapi-...   (or ANTHROPIC_API_KEY, OPENROUTER_API_KEY, GEMINI_API_KEY, …)"
 echo "[revapi] then run:  revapi"

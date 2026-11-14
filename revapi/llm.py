@@ -29,6 +29,7 @@ PROVIDERS: dict[str, tuple[str, str | None, str]] = {
     "together": ("https://api.together.xyz/v1", "TOGETHER_API_KEY", "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8"),
     "cerebras": ("https://api.cerebras.ai/v1", "CEREBRAS_API_KEY", "gpt-oss-120b"),
     "opencode": ("https://opencode.ai/zen/v1", "OPENCODE_API_KEY", "big-pickle"),
+    "nvidia": ("https://integrate.api.nvidia.com/v1", "NVIDIA_API_KEY", "moonshotai/kimi-k2.6"),  # NVIDIA NIM (build.nvidia.com), keys start with nvapi-
     "ollama": ("http://127.0.0.1:11434/v1", None, "qwen2.5-coder:7b"),
     "lmstudio": ("http://127.0.0.1:1234/v1", None, "local-model"),
     "pollinations": ("https://text.pollinations.ai/openai", "POLLINATIONS_TOKEN", "openai"),  # free, no key needed
@@ -204,10 +205,18 @@ def _parse_args(raw: Any) -> dict:
 
 class LLM:
     def __init__(
-        self, provider: str = "auto", model: str | None = None, api_key: str | None = None, base_url: str | None = None, effort: str | None = None, timeout: float = 300, max_tokens: int = 16000
+        self,
+        provider: str = "auto",
+        model: str | None = None,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        effort: str | None = None,
+        timeout: float = 300,
+        max_tokens: int = 16000,
+        require_key: bool = True,
     ) -> None:
         if provider == "auto":
-            provider = detect_provider()
+            provider = "nvidia" if (api_key or "").startswith("nvapi-") else detect_provider()
         if provider not in PROVIDERS:
             raise LLMError(f"unknown provider {provider!r}; choose from {', '.join(PROVIDERS)}", "config")
         default_base, env, default_model = PROVIDERS[provider]
@@ -215,14 +224,16 @@ class LLM:
         self.base_url = (base_url or os.environ.get("REVAPI_BASE_URL") if provider == "custom" else base_url) or default_base
         if provider == "ollama":
             self.base_url = base_url or os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/") + "/v1"
-        self.api_key = api_key or (os.environ.get(env) if env else None) or (os.environ.get("GOOGLE_API_KEY") if provider == "gemini" else None)
+        self.api_key = (
+            api_key or (os.environ.get(env) if env else None) or (os.environ.get("GOOGLE_API_KEY") if provider == "gemini" else None) or (os.environ.get("NVAPI_KEY") if provider == "nvidia" else None)
+        )
         self.model = model or default_model
         self.effort = effort
         self.timeout = timeout
         self.max_tokens = max_tokens
         if not self.base_url:
             raise LLMError("custom provider needs base_url (config `base_url` or REVAPI_BASE_URL)", "config")
-        if env and not self.api_key and provider not in ("pollinations", "custom"):
+        if require_key and env and not self.api_key and provider not in ("pollinations", "custom"):
             raise LLMError(f"{provider} needs an API key: export {env}=... (or `revapi config set api_key ...`)", "auth")
 
     def describe(self) -> str:
@@ -231,7 +242,28 @@ class LLM:
     def chat(self, messages: list[dict], tools: list[dict] | None = None) -> Reply:
         if self.provider == "anthropic":
             return self._anthropic(messages, tools)
-        return self._openai(messages, tools)
+        try:
+            return self._openai(messages, tools)
+        except LLMError as e:
+            # some hosted models cap output tokens lower than our default -> retry smaller once
+            if self.max_tokens > 4096 and re.search(r"max_(completion_)?tokens|max_new_tokens|maximum.*tokens|tokens.*exceed", str(e), re.I):
+                self.max_tokens = 4096
+                return self._openai(messages, tools)
+            raise
+
+    def list_models(self) -> list[str]:
+        """Model ids from the provider's /models endpoint (OpenAI-compatible providers and Anthropic)."""
+        if self.provider == "pollinations":
+            url, headers = "https://text.pollinations.ai/models", {}
+        elif self.provider == "anthropic":
+            url, headers = self.base_url.rstrip("/") + "/models", {"x-api-key": self.api_key or "", "anthropic-version": "2023-06-01"}
+        else:
+            url, headers = self.base_url.rstrip("/") + "/models", ({"Authorization": f"Bearer {self.api_key}"} if self.api_key else {})
+        req = urllib.request.Request(url, headers={"User-Agent": "revapi", **headers})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = json.loads(r.read().decode())
+        items = data if isinstance(data, list) else data.get("data") or data.get("models") or []
+        return sorted(str(m.get("id") or m.get("name")) if isinstance(m, dict) else str(m) for m in items)
 
     # -- OpenAI-compatible ----------------------------------------------------
     def _openai(self, messages: list[dict], tools: list[dict] | None) -> Reply:
@@ -332,12 +364,14 @@ class LLM:
 
 def detect_provider() -> str:
     """First provider with a key in the environment; else a local Ollama; else free Pollinations."""
-    for name in ("anthropic", "openai", "openrouter", "gemini", "groq", "deepseek", "mistral", "xai", "together", "cerebras", "opencode"):
+    for name in ("anthropic", "openai", "openrouter", "gemini", "nvidia", "groq", "deepseek", "mistral", "xai", "together", "cerebras", "opencode"):
         env = PROVIDERS[name][1]
         if env and os.environ.get(env):
             return name
     if os.environ.get("GOOGLE_API_KEY"):
         return "gemini"
+    if os.environ.get("NVAPI_KEY"):
+        return "nvidia"
     if os.environ.get("REVAPI_BASE_URL"):
         return "custom"
     try:
