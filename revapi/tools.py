@@ -330,6 +330,14 @@ def file_tools(ctx: Context) -> list[Tool]:
         p.write_text(content, encoding="utf-8")
         return f"wrote {p} ({len(content)} chars, {content.count(chr(10)) + 1} lines)"
 
+    def append_file(path: str, content: str) -> str:
+        p = ctx.resolve(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as f:
+            f.write(content)
+        total = p.read_text(encoding="utf-8", errors="replace")
+        return f"appended {len(content)} chars to {p} (now {total.count(chr(10)) + 1} lines)"
+
     def edit_file(path: str, old_text: str, new_text: str, replace_all: bool = False) -> str:
         p = ctx.resolve(path)
         s = p.read_text(encoding="utf-8")
@@ -376,6 +384,12 @@ def file_tools(ctx: Context) -> list[Tool]:
     return [
         Tool("read_file", "Read a text file (relative paths are in the output directory). Returns numbered lines.", _obj({"path": S, "offset": I, "limit": I}, ["path"]), read_file),
         Tool("write_file", "Create or overwrite a file with full content.", _obj({"path": S, "content": S}, ["path", "content"]), write_file),
+        Tool(
+            "append_file",
+            "Append content to the end of a file (creates it if missing). Write big files in parts: write_file the first part, then append_file the rest, about 120 lines per call. Content is appended verbatim, so end each part with a newline.",
+            _obj({"path": S, "content": S}, ["path", "content"]),
+            append_file,
+        ),
         Tool(
             "edit_file",
             "Replace exact text in a file (must match once unless replace_all).",

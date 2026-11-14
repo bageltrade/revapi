@@ -45,7 +45,7 @@ Or install straight from GitHub without cloning:
 ```bash
 pip install git+https://github.com/bageltrade/revapi.git
 # or a release wheel:
-pip install https://github.com/bageltrade/revapi/releases/download/v0.3.0/revapi-0.3.0-py3-none-any.whl
+pip install https://github.com/bageltrade/revapi/releases/download/v0.3.1/revapi-0.3.1-py3-none-any.whl
 ```
 
 ### Linux / macOS / WSL
@@ -90,6 +90,8 @@ revapi config set provider custom && revapi config set base_url https://my-host/
 With no key and no local Ollama, revapi falls back to **Pollinations**. It is free and needs no key, but it is slow: about one reply every 45 seconds, which revapi waits out for you. A real model gives far better clients.
 
 ---
+
+NVIDIA's gateway doesn't stream tool-call arguments. It holds back the whole call until the model finishes writing it, and closes the stream after 300 seconds of silence, without a finish reason. A model writing a big file in one call could lose the whole reply, and retrying the same request just failed again. On NVIDIA, revapi now tells the model to write big files in parts of about 120 lines (`write_file`, then `append_file`). If a stream is still cut after a long silence, the retry asks for smaller calls instead of repeating the request. While it waits, the status line shows `provider silent 2m10s · composing a tool call`. For other providers, set `REVAPI_CHUNK_WRITES=1` to get the same behaviour from the start.
 
 ## Modes
 

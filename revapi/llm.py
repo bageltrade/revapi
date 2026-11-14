@@ -195,6 +195,7 @@ def _send(
     retries: int = DEFAULT_RETRIES,
     on_retry: RetryHook | None = None,
     on_reset: Callable[[], None] | None = None,
+    rebuild: Callable[[], dict | None] | None = None,
 ) -> Any:
     data = json.dumps(body).encode()
     attempt = 0  # failed attempts so far
@@ -253,6 +254,9 @@ def _send(
             if on_reset:
                 on_reset()
             again(f"stream interrupted ({e})", "network")
+            fresh = rebuild() if rebuild else None
+            if fresh is not None:  # the next attempt asks differently (e.g. smaller tool calls), not the same thing again
+                data = json.dumps(fresh).encode()
         except LLMError as e:
             if getattr(e, "retryable", False):
                 if on_reset:
@@ -299,8 +303,13 @@ def _sse(resp: Any, state: dict[str, Any] | None = None) -> Any:
         return
     buf: list[str] = []
     got_any = False
+    state["t_last"] = time.monotonic()
+    state.setdefault("max_gap", 0.0)
     try:
         for raw in resp:
+            now = time.monotonic()
+            state["max_gap"] = max(state["max_gap"], now - state["t_last"])
+            state["t_last"] = now
             line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
             if not line:
                 if buf:
@@ -328,6 +337,22 @@ def _sse(resp: Any, state: dict[str, Any] | None = None) -> Any:
         raise StreamDropped(f"{type(e).__name__}") from None
     if not got_any:
         raise StreamDropped("stream ended before any data")
+
+
+def _complete_json(text: str) -> bool:
+    try:
+        return isinstance(json.loads(text or "{}"), dict)
+    except ValueError:
+        return False
+
+
+def with_chunk_hint(msgs: list[dict]) -> list[dict]:
+    """The system prompt plus the instruction to keep tool calls small."""
+    if msgs and msgs[0].get("role") == "system" and isinstance(msgs[0].get("content"), str):
+        if CHUNK_HINT in msgs[0]["content"]:
+            return msgs
+        return [{**msgs[0], "content": msgs[0]["content"] + "\n\n" + CHUNK_HINT}, *msgs[1:]]
+    return [{"role": "system", "content": CHUNK_HINT}, *msgs]
 
 
 class ThinkSplitter:
@@ -465,6 +490,17 @@ def wire_effort(effort: str) -> str:
     return "high" if effort in ("xhigh", "max") else effort
 
 
+# NVIDIA's gateway (and some other hosts) hold back tool-call arguments until the call is complete and close a
+# stream after ~300 s without bytes, with no finish_reason. A model writing a big file in one write_file call then
+# loses the whole reply, and asking the same thing again fails the same way. Small calls avoid it.
+SILENT_CUT_S = 90.0  # a cut after this much silence is a held-back tool call, not a network blip
+CHUNK_HINT = (
+    "IMPORTANT, provider limit: this API drops any single tool call that takes more than a few minutes to generate, "
+    "so large files must be written in parts. Keep every tool call short: write_file with at most ~120 lines, then "
+    "append_file for each next part of at most ~120 lines. Think briefly before writing; the plan is already clear."
+)
+
+
 OPTIONAL_KEYS = ("stream_options", "chat_template_kwargs", "reasoning", "include_reasoning", "reasoning_effort", "tool_choice", "parallel_tool_calls", "usage")
 INTERNAL_KEYS = ("reasoning", "thinking_blocks", "_seq", "seq", "ts", "usage")
 
@@ -511,6 +547,8 @@ class LLM:
         self.effort = effort
         self.timeout = timeout
         self.max_tokens = max_tokens
+        self.chunk_writes = provider == "nvidia" or bool(os.environ.get("REVAPI_CHUNK_WRITES"))
+        self.silent_cuts = 0
         self.stream = (os.environ.get("REVAPI_NO_STREAM") is None) if stream is None else stream
         self.retries = max(1, int(retries or os.environ.get("REVAPI_RETRIES") or DEFAULT_RETRIES))
         self.context_window = int(context or os.environ.get("REVAPI_CONTEXT_WINDOW") or context_window(self.model))
@@ -588,6 +626,8 @@ class LLM:
             if m.get("tool_calls"):
                 m = {**m, "tool_calls": [{**tc, "function": {**tc["function"], "name": clean_name(tc["function"]["name"])}} for tc in m["tool_calls"]]}
             msgs.append(m)
+        if self.chunk_writes and tools and any(t.get("name") == "append_file" for t in tools):
+            msgs = with_chunk_hint(msgs)
         body: dict[str, Any] = {"model": self.model, "messages": msgs}
         opt: dict[str, Any] = {}
         if tools:
@@ -679,7 +719,15 @@ class LLM:
                     if ch.get("finish_reason"):
                         finish = ch["finish_reason"]
             if not finish and not state.get("done"):
-                raise StreamDropped("stream ended before the reply was complete")  # cut mid-reply: ask again
+                if calls and all(_complete_json(c["args"]) for c in calls.values()) and all(c["name"] for c in calls.values()):
+                    finish = "tool_calls"  # some gateways close without a final chunk after a whole tool call
+                else:
+                    gap = max(state.get("max_gap", 0.0), time.monotonic() - state.get("t_last", time.monotonic()))
+                    if gap >= SILENT_CUT_S:
+                        self.silent_cuts += 1
+                        self.chunk_writes = True
+                        raise StreamDropped(f"the provider sent nothing for {gap:.0f}s, then closed the stream; it holds back tool calls until they are complete, so revapi now asks for smaller ones")
+                    raise StreamDropped("stream ended before the reply was complete")  # cut mid-reply: ask again
             split.flush()
             reply = Reply(content=split.text, reasoning=(reasoning + split.think).strip(), finish_reason=finish)
             for _, c in sorted(calls.items()):
@@ -690,7 +738,22 @@ class LLM:
             reply.usage = self._usage(usage, messages, reply)
             return reply
 
-        return _send(url, body, headers, self.timeout, consume=consume, retries=self.retries, on_retry=on_retry, on_reset=lambda: emit("reset", None))
+        cuts_seen = self.silent_cuts
+
+        def rebuild() -> dict | None:
+            nonlocal cuts_seen
+            if self.silent_cuts == cuts_seen:
+                return None
+            cuts_seen = self.silent_cuts
+            note = (
+                f"[revapi] Your last reply was lost: the provider closed the stream while you were composing a tool call "
+                f"(lost {self.silent_cuts} time(s) so far). Do not repeat the same large call. {CHUNK_HINT}"
+            )
+            fresh = self._openai_body(messages, tools, stream)
+            fresh["messages"] = [*fresh["messages"], {"role": "user", "content": note}]
+            return fresh
+
+        return _send(url, body, headers, self.timeout, consume=consume, retries=self.retries, on_retry=on_retry, on_reset=lambda: emit("reset", None), rebuild=rebuild)
 
     def _openai_reply(self, data: dict) -> Reply:
         if "error" in data and not data.get("choices"):

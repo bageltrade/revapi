@@ -307,7 +307,7 @@ def run_engineer(
         ask_user_note=ask_note(interactive),
         tools_note=HERMES_TOOLS_NOTE
         if use_hermes
-        else "Tools: har_overview / har_search / har_entry to explore traffic; read_file / write_file / edit_file / list_dir for files; shell to install dependencies and run tests; web_fetch for public docs. Call `finish` with your final response when done.",
+        else "Tools: har_overview / har_search / har_entry to explore traffic; read_file / write_file / append_file / edit_file / list_dir for files; shell to install dependencies and run tests; web_fetch for public docs. Call `finish` with your final response when done.",
     )
     guidance = ""
     if existing:

@@ -406,6 +406,56 @@ class Unit(unittest.TestCase):
         self.assertEqual(seen.count("reset"), 2)
         self.assertEqual(len(net.calls), 3)
 
+    def test_nvidia_silent_tool_call_cut_asks_for_smaller_calls(self) -> None:
+        """NVIDIA holds back tool-call arguments and closes after ~300 s of silence with no finish_reason.
+        revapi must not resend the same request: the retry asks for smaller calls (append_file)."""
+
+        class Silent(_Resp):
+            def __iter__(self):  # noqa: ANN204
+                yield from self.body.splitlines(keepends=True)
+                import time as _t
+
+                _t.sleep(0.3)  # the gateway's silence, then a clean close
+
+        cut = Silent(b'data: {"choices": [{"delta": {"reasoning_content": "plan done"}}]}\n\ndata: {"choices": [{"delta": {"content": "Writing the client:"}}]}\n\n', "text/event-stream")
+        call = {"index": 0, "id": "c1", "function": {"name": "append_file", "arguments": json.dumps({"path": "a.py", "content": "x = 1\\n"})}}
+        good = _Resp(b'data: {"choices": [{"delta": {"tool_calls": [' + json.dumps(call).encode() + b"]}}]}\n\n", "text/event-stream")  # whole call, no finish, no [DONE]
+        net = FakeNet([cut, good])
+        tools = [{"name": n, "description": "", "parameters": {"type": "object", "properties": {}}} for n in ("write_file", "append_file")]
+        reasons: list[str] = []
+        msgs = [{"role": "system", "content": "you are an agent"}, {"role": "user", "content": "write the client"}]
+        with net, mock.patch("revapi.llm._sleep"), mock.patch.object(llmmod, "SILENT_CUT_S", 0.2):
+            llm = LLM(provider="openai", api_key="k")
+            self.assertFalse(llm.chunk_writes)
+            r = llm.chat(msgs, tools, on_delta=lambda k, p: None, on_retry=lambda a, n, w, why: reasons.append(why))
+        self.assertEqual([t["name"] for t in r.tool_calls], ["append_file"])  # a complete call without finish_reason is accepted
+        self.assertIn("sent nothing", reasons[0])
+        second = net.calls[1]["body"]["messages"]
+        self.assertIn("append_file", second[0]["content"])  # the system prompt now carries the limit
+        self.assertTrue(second[-1]["content"].startswith("[revapi] Your last reply was lost"))
+        self.assertTrue(llm.chunk_writes)
+        self.assertEqual(msgs[-1]["content"], "write the client")  # the agent's own transcript is untouched
+        # nvidia gets the hint from the first request
+        nv = LLM(provider="nvidia", api_key="nvapi-x")
+        self.assertIn("append_file", nv._openai_body(msgs, tools, True)["messages"][0]["content"])
+        self.assertNotIn("append_file", LLM(provider="openai", api_key="k")._openai_body(msgs, tools, True)["messages"][0]["content"])
+        # a cut without the long silence still retries the same request
+        net2 = FakeNet([_Resp(b'data: {"choices": [{"delta": {"content": "half"}}]}\n\n', "text/event-stream"), _sse_resp([{"choices": [{"delta": {"content": "whole"}, "finish_reason": "stop"}]}])])
+        with net2, mock.patch("revapi.llm._sleep"):
+            llm2 = LLM(provider="openai", api_key="k")
+            self.assertEqual(llm2.chat(msgs, tools, on_delta=lambda k, p: None, on_retry=lambda *a: None).content, "whole")
+        self.assertEqual(net2.calls[0]["body"], net2.calls[1]["body"])
+
+    def test_append_file_tool(self) -> None:
+        d = Path(tempfile.mkdtemp())
+        from revapi.tools import file_tools
+
+        tools = {t.name: t for t in file_tools(Context(workdir=d))}
+        tools["write_file"].handler(path="c.py", content="a = 1\n")
+        out = tools["append_file"].handler(path="c.py", content="b = 2\n")
+        self.assertIn("now 3 lines", out)
+        self.assertEqual((d / "c.py").read_text(), "a = 1\nb = 2\n")
+
     def test_mid_stream_overload_error_is_retried(self) -> None:
         bad = _sse_resp([{"error": {"message": "Provider overloaded, try again", "code": 503}}])
         good = _sse_resp([{"choices": [{"delta": {"content": "fine"}, "finish_reason": "stop"}]}])

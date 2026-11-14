@@ -143,6 +143,7 @@ def describe(name: str, a: dict[str, Any]) -> tuple[str, str, str, str | None] |
         "har_entry": ("request", f"#{a.get('index', '?')}" + (f" · {a.get('part')}" if a.get("part") not in (None, "all") else ""), "read"),
         "read_file": ("read", Path(path).name if path else "file", "read"),
         "write_file": ("write", Path(path).name if path else "file", "write"),
+        "append_file": ("append", Path(path).name if path else "file", "write"),
         "edit_file": ("edit", Path(path).name if path else "file", "write"),
         "list_dir": ("list", path or ".", "read"),
         "shell": ("run", first_line(a.get("command") or "command"), "run"),
@@ -196,6 +197,8 @@ class Reporter:
         self.retry: dict[str, Any] | None = None
         self.tool_stream: dict[str, Any] | None = None
         self.turn_t0 = time.time()
+        self.last_byte = time.time()
+        self.awaiting_model = False
         self.think = ""
         self.think_t0 = 0.0
         self.think_done = True
@@ -278,12 +281,18 @@ class Reporter:
             head = f" {sty(T.spinner_frame(), AMBER)} {sty(verb, AMBER, italic=True)}"
         else:
             verb = self.verb
-            if self.tool_stream:
+            tail = ""
+            silent = now - self.last_byte if self.awaiting_model and not self.retry else 0
+            if silent >= 20:
+                tint = AMBER
+                verb = "provider silent"  # the counter stays outside the split-flap, which restarts on every change
+                tail = f" {silent:.0f}s" + (" · composing a tool call" if (self.text_partial or self.streamed or self.think_done) else "")
+            elif self.tool_stream:
                 ts = self.tool_stream
                 verb = f"{ts['verb']} · {T.k(ts['chars'])} chars"
             elif not self.think_done and self.think:
                 verb = "thinking"
-            head = f" {sty(T.spinner_frame(), tint)} {sty(self._flap(verb), INK, italic=True)}"
+            head = f" {sty(T.spinner_frame(), tint)} {sty(self._flap(verb), INK, italic=True)}" + (sty(tail, AMBER, italic=True) if tail else "")
         right_bits = [T.elapsed(now - self.t0)]
         tok = (self.usage.get("input_tokens", 0) or 0) + (self.usage.get("output_tokens", 0) or 0)
         if tok:
@@ -401,7 +410,7 @@ class Reporter:
         shown = T.link(target, url) if url else target
         self.out(f" {sty('*', tint)} {sty(f'{self.step:02d}', DIM)}  {sty(f'{verb:<{VERB_COL}}', tint, bold=True)} {sty(shown, INK_SOFT)}")
         path = args.get("path") if isinstance(args.get("path"), str) else None
-        if name == "write_file" and path and isinstance(args.get("content"), str):
+        if name in ("write_file", "append_file") and path and isinstance(args.get("content"), str):
             self.client = Path(path).name
             self._code(args["content"], LANG_BY_EXT.get(Path(path).suffix.lower(), ""))
         elif name == "edit_file" and isinstance(args.get("old_text"), str) and isinstance(args.get("new_text"), str):
@@ -435,7 +444,7 @@ class Reporter:
         text = (output or "").strip()
         lines = [re.sub(r"^#+\s+", "", ln.rstrip()) for ln in text.splitlines() if ln.strip()]
         if not is_error:
-            if name in ("write_file", "edit_file", "finish", "ask_user"):
+            if name in ("write_file", "append_file", "edit_file", "finish", "ask_user"):
                 return
             if name in ("browser_snapshot", "browser_take_screenshot"):
                 lines = [f"{len(lines)} lines captured"] if name == "browser_snapshot" else lines[:1]
@@ -470,6 +479,9 @@ class Reporter:
             self.ctx = (data.get("tokens", 0), data.get("window", 0))
             self.emit("context", tokens=self.ctx[0], window=self.ctx[1])
             return
+        if kind in ("thinking_start", "thinking_delta", "text_delta", "tool_delta", "stream_reset"):
+            self.last_byte = time.time()
+            self.awaiting_model = True
         if kind == "thinking_start":
             self.turn_t0 = time.time()
             self.think, self.think_done, self.think_t0 = "", True, 0.0
@@ -504,7 +516,9 @@ class Reporter:
             name = data.get("name") or ""
             m = re.search(r'"path"\s*:\s*"([^"]+)"', data.get("args") or "")
             target = Path(m.group(1)).name if m else ""
-            verb = {"write_file": "writing", "edit_file": "editing", "shell": "preparing a command", "save_items": "collecting"}.get(name, f"calling {name}" if name else "calling a tool")
+            verb = {"write_file": "writing", "append_file": "appending to", "edit_file": "editing", "shell": "preparing a command", "save_items": "collecting"}.get(
+                name, f"calling {name}" if name else "calling a tool"
+            )
             self.tool_stream = {"verb": f"{verb} {target}".strip(), "chars": data.get("chars", 0)}
             return
         if kind == "stream_reset":
@@ -546,6 +560,7 @@ class Reporter:
             self.stop()
             return
         if kind == "tool_start":
+            self.awaiting_model = False
             self._settle_thinking()
             self._close_stream()
             self._reset_text()
