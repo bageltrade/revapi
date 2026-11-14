@@ -13,6 +13,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -31,28 +32,101 @@ from revapi.browser import Browser, find_chromium, is_api_like  # noqa: E402
 from revapi.cdp import _xor_mask  # noqa: E402
 from revapi.llm import LLM, Reply, Usage  # noqa: E402
 from revapi.prompts import load  # noqa: E402
+from revapi import term as termmod  # noqa: E402
+from revapi.agent import Agent  # noqa: E402
+from revapi.tools import Context, Tool  # noqa: E402
 from revapi.ui import Reporter  # noqa: E402
 
 HAS_CHROMIUM = bool(find_chromium())
 SAMPLE_HAR = Path("/home/user/.reverse-api/runs/har/59c7dc3b7609/recording.har")
 
 
+class _Resp:
+    def __init__(self, body: bytes, ctype: str = "application/json", die: bool = False) -> None:
+        self.body, self.die = body, die
+        self.headers = {"content-type": ctype}
+
+    def read(self) -> bytes:
+        return self.body
+
+    def __iter__(self):  # noqa: ANN204
+        for line in self.body.splitlines(keepends=True):
+            yield line
+        if self.die:
+            raise ConnectionResetError("connection reset by peer")
+
+    def __enter__(self):  # noqa: ANN204
+        return self
+
+    def __exit__(self, *a) -> None:  # noqa: ANN002
+        return None
+
+
+def _json(obj: dict) -> _Resp:
+    return _Resp(json.dumps(obj).encode())
+
+
+def _sse_resp(events: list[dict], die: bool = False) -> _Resp:
+    body = "".join(f"data: {json.dumps(e)}\n\n" for e in events) + ("" if die else "data: [DONE]\n\n")
+    return _Resp(body.encode(), "text/event-stream", die)
+
+
+def _http_error(code: int, text: str, headers: dict | None = None) -> Exception:
+    import io
+    import urllib.error
+
+    return urllib.error.HTTPError("http://x", code, "err", headers or {}, io.BytesIO(text.encode()))
+
+
+class FakeNet:
+    """Stands in for urllib.request.urlopen: plays back responses/exceptions and records requests."""
+
+    def __init__(self, plan: list) -> None:  # noqa: ANN001
+        self.plan = list(plan)
+        self.calls: list[dict] = []
+        self._p = mock.patch("urllib.request.urlopen", self)
+
+    def __call__(self, req, timeout=0):  # noqa: ANN001, ANN204
+        self.calls.append({"url": req.full_url, "body": json.loads(req.data or b"{}"), "headers": dict(req.header_items())})
+        step = self.plan.pop(0)
+        if isinstance(step, BaseException):
+            raise step
+        return step
+
+    def __enter__(self):  # noqa: ANN204
+        self._p.start()
+        return self
+
+    def __exit__(self, *a) -> None:  # noqa: ANN002
+        self._p.stop()
+
+
 class FakeLLM(LLM):
     """Plays back a script: each item is a list of (tool, args) or a final text."""
 
-    def __init__(self, script):  # noqa: ANN001
+    def __init__(self, script, window: int = 128_000):  # noqa: ANN001
         self.provider, self.model, self.api_key, self.effort = "fake", "scripted", "x", None
+        self.context_window, self.max_tokens = window, 1000
         self.script = list(script)
         self.seen: list[list[dict]] = []
+        self.summaries = 0
 
-    def chat(self, messages, tools=None):  # noqa: ANN001
-        self.seen.append(json.loads(json.dumps(messages)))
+    def chat(self, messages, tools=None, on_delta=None, on_retry=None, stream=None):  # noqa: ANN001
+        if tools is None and "compacting the working memory" in (messages[0].get("content") or ""):
+            self.summaries += 1
+            return Reply(content=f"<analysis>x</analysis><summary>SUMMARY-{self.summaries}: endpoints GET /api/todos</summary>", usage=Usage(input_tokens=50, output_tokens=20, requests=1))
+        self.seen.append(json.loads(json.dumps([llmmod.wire(m) for m in messages])))
         step = self.script.pop(0) if self.script else "done"
         r = Reply(usage=Usage(input_tokens=100, output_tokens=10, requests=1))
         if callable(step):
             step = step(messages)
+        if isinstance(step, Exception):
+            raise step
         if isinstance(step, str):
             r.content = step
+            if on_delta:
+                for part in (step[: len(step) // 2], step[len(step) // 2 :]):
+                    on_delta("text", part)
         else:
             r.tool_calls = [{"id": f"c{len(self.seen)}_{i}", "name": n, "arguments": a} for i, (n, a) in enumerate(step)]
         return r
@@ -154,70 +228,361 @@ class Unit(unittest.TestCase):
             llm = LLM()
             self.assertEqual((llm.provider, llm.model, llm.base_url), ("nvidia", "stepfun-ai/step-5-preview", "https://integrate.api.nvidia.com/v1"))
         self.assertEqual(LLM(api_key="nvapi-abc").provider, "nvidia")  # key prefix picks the provider
-        calls = []
-
-        def fake_post(url, body, headers, timeout):  # noqa: ANN001
-            calls.append((url, body, headers))
-            if len(calls) == 1:
-                raise llmmod.LLMError('HTTP 400: {"detail":"max_tokens must be <= 8192"}')
-            return {"choices": [{"message": {"content": "ok", "reasoning_content": "think"}}], "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
-
-        with mock.patch.object(llmmod, "_post", fake_post):
-            r = LLM(provider="nvidia", api_key="nvapi-k").chat([{"role": "user", "content": "hi"}])
+        net = FakeNet(
+            [
+                _http_error(400, '{"detail":"max_tokens must be <= 8192"}'),
+                _json({"choices": [{"message": {"content": "ok", "reasoning_content": "think"}}], "usage": {"prompt_tokens": 1, "completion_tokens": 1}}),
+            ]
+        )
+        with net:
+            r = LLM(provider="nvidia", api_key="nvapi-k", stream=False).chat([{"role": "user", "content": "hi"}])
         self.assertEqual((r.content, r.reasoning), ("ok", "think"))
-        self.assertEqual(calls[0][0], "https://integrate.api.nvidia.com/v1/chat/completions")
-        self.assertEqual(calls[0][2]["Authorization"], "Bearer nvapi-k")
-        self.assertEqual(calls[1][1]["max_tokens"], 4096)  # retried with a smaller output cap
+        self.assertEqual(net.calls[0]["url"], "https://integrate.api.nvidia.com/v1/chat/completions")
+        self.assertEqual(net.calls[0]["headers"]["Authorization"], "Bearer nvapi-k")
+        self.assertEqual(net.calls[1]["body"]["max_tokens"], 4096)  # retried with a smaller output cap
 
     def test_openai_and_anthropic_wire_format(self) -> None:
-        calls = []
-
-        def fake_post(url, body, headers, timeout):  # noqa: ANN001
-            calls.append((url, body, headers))
-            if "anthropic" in url:
-                return {
-                    "content": [{"type": "text", "text": "hi"}, {"type": "tool_use", "id": "t1", "name": "x", "input": {"a": 1}}],
-                    "usage": {"input_tokens": 5, "output_tokens": 2, "cache_read_input_tokens": 3},
-                    "stop_reason": "tool_use",
-                }
-            return {
-                "choices": [{"message": {"content": "", "tool_calls": [{"id": "t1", "function": {"name": "x", "arguments": '{"a": 1}'}}]}, "finish_reason": "tool_calls"}],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 3},
-            }
-
         msgs = [
             {"role": "system", "content": "sys"},
-            {"role": "user", "content": "u"},
-            {"role": "assistant", "content": None, "tool_calls": [{"id": "t0", "type": "function", "function": {"name": "x", "arguments": "{}"}}]},
+            {"role": "user", "content": "u", "_seq": 1},
+            {"role": "assistant", "content": None, "reasoning": "r", "tool_calls": [{"id": "t0", "type": "function", "function": {"name": "x", "arguments": "{}"}}]},
             {"role": "tool", "tool_call_id": "t0", "content": "res"},
         ]
         tools = [{"name": "x", "description": "d", "parameters": {"type": "object", "properties": {}}}]
-        with mock.patch.object(llmmod, "_post", fake_post):
-            r = LLM(provider="openai", api_key="k", model="gpt-4.1").chat(msgs, tools)
+        net = FakeNet(
+            [
+                _json(
+                    {
+                        "choices": [{"message": {"content": "", "tool_calls": [{"id": "t1", "function": {"name": "x", "arguments": '{"a": 1}'}}]}, "finish_reason": "tool_calls"}],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 3},
+                    }
+                ),
+                _json(
+                    {
+                        "content": [{"type": "text", "text": "hi"}, {"type": "tool_use", "id": "t1", "name": "x", "input": {"a": 1}}],
+                        "usage": {"input_tokens": 5, "output_tokens": 2, "cache_read_input_tokens": 3},
+                        "stop_reason": "tool_use",
+                    }
+                ),
+            ]
+        )
+        with net:
+            r = LLM(provider="openai", api_key="k", model="gpt-4.1", stream=False).chat(msgs, tools)
             self.assertEqual(r.tool_calls[0]["arguments"], {"a": 1})
             self.assertGreater(r.usage.estimated_cost_usd, 0)
-            r2 = LLM(provider="anthropic", api_key="k", model="claude-sonnet-4-5").chat(msgs, tools)
+            r2 = LLM(provider="anthropic", api_key="k", model="claude-sonnet-4-5", stream=False).chat(msgs, tools)
             self.assertEqual((r2.content, r2.tool_calls[0]["name"], r2.usage.input_tokens), ("hi", "x", 8))
-        ab = calls[1][1]
+        ob, ab = net.calls[0]["body"], net.calls[1]["body"]
+        self.assertNotIn("_seq", ob["messages"][1])  # bookkeeping never reaches the provider
+        self.assertNotIn("reasoning", ob["messages"][2])
         self.assertEqual(ab["system"][0]["text"], "sys")
         self.assertEqual(ab["messages"][1]["content"][0]["type"], "tool_use")
         self.assertEqual(ab["messages"][2]["content"][0]["type"], "tool_result")
-        self.assertEqual(calls[0][1]["tools"][0]["type"], "function")
+        self.assertEqual(ob["tools"][0]["type"], "function")
 
-    def test_throttle_retry(self) -> None:
-        import io
+    def test_openai_streaming_reasoning_and_tool_calls(self) -> None:
+        events = [
+            {"choices": [{"delta": {"role": "assistant", "reasoning_content": "Let me "}}]},
+            {"choices": [{"delta": {"reasoning_content": "think."}}]},
+            {"choices": [{"delta": {"content": "Writ"}}]},
+            {"choices": [{"delta": {"content": "ing now"}}]},
+            {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_9", "type": "function", "function": {"name": "write_file", "arguments": '{"pa'}}]}}]},
+            {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": 'th": "a.py", "content": "x=1"}'}}]}}]},
+            {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+            {"choices": [], "usage": {"prompt_tokens": 120, "completion_tokens": 30}},
+        ]
+        net = FakeNet([_sse_resp(events)])
+        seen: list[tuple[str, Any]] = []
+        with net:
+            r = LLM(provider="nvidia", api_key="nvapi-k").chat(
+                [{"role": "user", "content": "go"}], [{"name": "write_file", "parameters": {"type": "object"}}], on_delta=lambda k, p: seen.append((k, p))
+            )
+        body = net.calls[0]["body"]
+        self.assertTrue(body["stream"])
+        self.assertEqual(body["stream_options"], {"include_usage": True})
+        self.assertEqual(r.reasoning, "Let me think.")
+        self.assertEqual(r.content, "Writing now")
+        self.assertEqual(r.tool_calls, [{"id": "call_9", "name": "write_file", "arguments": {"path": "a.py", "content": "x=1"}}])
+        self.assertEqual((r.usage.input_tokens, r.usage.output_tokens, r.finish_reason), (120, 30, "tool_calls"))
+        kinds = [k for k, _ in seen]
+        self.assertEqual(kinds[:4], ["thinking", "thinking", "text", "text"])
+        self.assertIn("tool", kinds)
+
+    def test_think_tags_split(self) -> None:
+        got: list[tuple[str, str]] = []
+        sp = llmmod.ThinkSplitter(lambda k, s: got.append((k, s)))
+        for part in ["<thi", "nk>reason", "ing</th", "ink>\n\nAnswer: use <think> tags"]:
+            sp.feed(part)
+        sp.flush()
+        self.assertEqual(sp.think, "reasoning")
+        self.assertEqual(sp.text, "Answer: use <think> tags")  # a tag inside the answer stays text
+        self.assertEqual(llmmod.split_think("<think>abc</think>\nHello", ""), ("Hello", "abc"))
+        self.assertEqual(llmmod.split_think("abc</think>Hello", ""), ("Hello", "abc"))
+
+    def test_anthropic_streaming_thinking_signature(self) -> None:
+        events = [
+            {"type": "message_start", "message": {"usage": {"input_tokens": 10, "cache_read_input_tokens": 4}}},
+            {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "plan it"}},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "SIG"}},
+            {"type": "content_block_stop", "index": 0},
+            {"type": "content_block_start", "index": 1, "content_block": {"type": "text", "text": ""}},
+            {"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": "Calling."}},
+            {"type": "content_block_start", "index": 2, "content_block": {"type": "tool_use", "id": "tu1", "name": "shell", "input": {}}},
+            {"type": "content_block_delta", "index": 2, "delta": {"type": "input_json_delta", "partial_json": '{"comm'}},
+            {"type": "content_block_delta", "index": 2, "delta": {"type": "input_json_delta", "partial_json": 'and": "ls"}'}},
+            {"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 7}},
+            {"type": "message_stop"},
+        ]
+        net = FakeNet([_sse_resp(events)])
+        llm = LLM(provider="anthropic", api_key="k", model="claude-sonnet-4-5", effort="low")
+        with net:
+            r = llm.chat([{"role": "user", "content": "x"}], [{"name": "shell", "parameters": {"type": "object"}}], on_delta=lambda k, p: None)
+        self.assertEqual((r.reasoning, r.content, r.finish_reason), ("plan it", "Calling.", "tool_use"))
+        self.assertEqual(r.thinking_blocks, [{"type": "thinking", "thinking": "plan it", "signature": "SIG"}])
+        self.assertEqual(r.tool_calls[0]["arguments"], {"command": "ls"})
+        self.assertEqual((r.usage.input_tokens, r.usage.output_tokens), (14, 7))
+        self.assertEqual(net.calls[0]["body"]["thinking"]["type"], "enabled")
+        # the signed thinking block travels back first on the next turn
+        msg = {
+            "role": "assistant",
+            "content": "Calling.",
+            "thinking_blocks": r.thinking_blocks,
+            "tool_calls": [{"id": "tu1", "type": "function", "function": {"name": "shell", "arguments": '{"command": "ls"}'}}],
+        }
+        body = llm._anthropic_body([{"role": "user", "content": "x"}, msg, {"role": "tool", "tool_call_id": "tu1", "content": "a.py"}], None, True)
+        self.assertEqual([b["type"] for b in body["messages"][1]["content"]], ["thinking", "text", "tool_use"])
+
+    def test_retries_network_and_5xx_then_success(self) -> None:
         import urllib.error
 
-        n = {"i": 0}
+        plan = [urllib.error.URLError("dns failure")] * 3 + [ConnectionResetError("reset")] * 2 + [_http_error(503, "busy"), _http_error(529, "overloaded")]
+        plan.append(_json({"choices": [{"message": {"content": "back online"}}]}))
+        net = FakeNet(plan)
+        retries: list[tuple[int, int, str]] = []
+        with net, mock.patch("time.sleep") as slept:
+            r = LLM(provider="openai", api_key="k", stream=False).chat([{"role": "user", "content": "x"}], on_retry=lambda a, n, w, why: retries.append((a, n, why)))
+        self.assertEqual(r.content, "back online")
+        self.assertEqual([a for a, _, _ in retries], [1, 2, 3, 4, 5, 6, 7])
+        self.assertEqual(retries[0][1], 40)  # 40 retries allowed
+        self.assertIn("network error", retries[0][2])
+        self.assertIn("HTTP 503", retries[5][2])
+        delays = [c.args[0] for c in slept.call_args_list]
+        self.assertTrue(all(0 < d <= 69 for d in delays))
+        self.assertGreater(delays[3], delays[0])  # exponential backoff
 
-        def fake_urlopen(req, timeout=0):  # noqa: ANN001
-            n["i"] += 1
-            if n["i"] == 1:
-                raise urllib.error.HTTPError(req.full_url, 402, "x", {}, io.BytesIO(b'{"message":"Retry after 0s"}'))
-            return io.BytesIO(b'{"choices":[{"message":{"content":"ok"}}]}')
+    def test_retries_give_up_after_40(self) -> None:
+        import urllib.error
 
-        with mock.patch("urllib.request.urlopen", fake_urlopen), mock.patch("time.sleep"):
-            self.assertEqual(llmmod._post("http://x", {}, {}, 1)["choices"][0]["message"]["content"], "ok")
+        net = FakeNet([urllib.error.URLError("offline")] * 60)
+        with net, mock.patch("time.sleep"):
+            with self.assertRaises(llmmod.LLMError) as cm:
+                LLM(provider="openai", api_key="k", stream=False).chat([{"role": "user", "content": "x"}], on_retry=lambda *a: None)
+        self.assertEqual(cm.exception.kind, "network")
+        self.assertEqual(len(net.calls), 41)  # the first attempt + 40 retries
+        self.assertIn("gave up after 40 retries", str(cm.exception))
+        self.assertEqual(LLM(provider="openai", api_key="k", retries=5).retries, 5)
+
+    def test_auth_errors_fail_fast_and_retry_after(self) -> None:
+        net = FakeNet([_http_error(401, '{"error":"bad key"}')])
+        with net, mock.patch("time.sleep"):
+            with self.assertRaises(llmmod.LLMError) as cm:
+                LLM(provider="openai", api_key="k", stream=False).chat([{"role": "user", "content": "x"}])
+        self.assertEqual((cm.exception.kind, len(net.calls)), ("auth", 1))
+        net = FakeNet([_http_error(429, "slow down", {"retry-after": "7"}), _json({"choices": [{"message": {"content": "ok"}}]})])
+        with net, mock.patch("time.sleep") as slept:
+            LLM(provider="openai", api_key="k", stream=False).chat([{"role": "user", "content": "x"}], on_retry=lambda *a: None)
+        self.assertEqual(slept.call_args_list[0].args[0], 7.5)  # Retry-After honoured
+
+    def test_stream_dropped_midway_is_retried(self) -> None:
+        good = _sse_resp([{"choices": [{"delta": {"content": "complete answer"}, "finish_reason": "stop"}]}])
+        broken = _sse_resp([{"choices": [{"delta": {"content": "half an ans"}}]}], die=True)
+        cut = _Resp(b'data: {"choices": [{"delta": {"reasoning_content": "partial thou"}}]}\n\n', "text/event-stream")  # closed cleanly, but no [DONE]
+        net = FakeNet([broken, cut, good])
+        seen: list[str] = []
+        with net, mock.patch("time.sleep"):
+            r = LLM(provider="openai", api_key="k").chat([{"role": "user", "content": "x"}], on_delta=lambda k, p: seen.append(k), on_retry=lambda *a: None)
+        self.assertEqual(r.content, "complete answer")
+        self.assertEqual(seen.count("reset"), 2)
+        self.assertEqual(len(net.calls), 3)
+
+    def test_mid_stream_overload_error_is_retried(self) -> None:
+        bad = _sse_resp([{"error": {"message": "Provider overloaded, try again", "code": 503}}])
+        good = _sse_resp([{"choices": [{"delta": {"content": "fine"}, "finish_reason": "stop"}]}])
+        net = FakeNet([bad, good])
+        with net, mock.patch("time.sleep"):
+            r = LLM(provider="openrouter", api_key="k").chat([{"role": "user", "content": "x"}], on_retry=lambda *a: None)
+        self.assertEqual(r.content, "fine")
+
+    def test_unsupported_optional_params_are_dropped(self) -> None:
+        net = FakeNet(
+            [
+                _http_error(400, '{"error":{"message":"Unrecognized request argument supplied: stream_options"}}'),
+                _http_error(400, '{"error":"chat_template_kwargs is not supported for this model"}'),
+                _sse_resp([{"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]}]),
+            ]
+        )
+        llm = LLM(provider="nvidia", api_key="nvapi-k", effort="high")
+        with net:
+            self.assertEqual(llm.chat([{"role": "user", "content": "x"}]).content, "ok")
+        self.assertIn("stream_options", net.calls[0]["body"])
+        self.assertNotIn("stream_options", net.calls[1]["body"])
+        self.assertIn("chat_template_kwargs", net.calls[1]["body"])
+        self.assertNotIn("chat_template_kwargs", net.calls[2]["body"])
+        self.assertEqual(llm._dropped, {"stream_options", "chat_template_kwargs"})
+
+    def test_context_errors_and_windows(self) -> None:
+        net = FakeNet([_http_error(400, '{"error":{"message":"This model\'s maximum context length is 131072 tokens. However, you requested 140000 tokens."}}')])
+        with net:
+            with self.assertRaises(llmmod.LLMError) as cm:
+                LLM(provider="openai", api_key="k", stream=False).chat([{"role": "user", "content": "x"}])
+        self.assertEqual((cm.exception.kind, cm.exception.window), ("context_length", 131072))
+        self.assertEqual(llmmod.context_window("claude-sonnet-4-5"), 200_000)
+        self.assertEqual(llmmod.context_window("moonshotai/kimi-k2.6"), 256_000)
+        self.assertEqual(llmmod.context_window("unknown/model"), llmmod.DEFAULT_WINDOW)
+        self.assertEqual(LLM(provider="openai", api_key="k", context=50_000).context_window, 50_000)
+
+    def test_compaction_keeps_everything_recallable(self) -> None:
+        tmp = Path(tempfile.mkdtemp())
+        big = lambda tag: f"BEGIN-{tag} " + ("payload " * 1200) + f" END-{tag}"  # noqa: E731
+        tool = Tool("probe", "returns a big blob", {"type": "object", "properties": {"tag": {"type": "string"}}, "required": ["tag"]}, lambda tag: big(tag))
+        script = [[("probe", {"tag": f"T{i}"})] for i in range(8)] + ["all done"]
+        llm = FakeLLM(script, window=9000)
+        events: list[tuple[str, dict]] = []
+        ag = Agent(llm, [tool], Context(workdir=tmp), "SYSTEM", tmp / "messages.jsonl", lambda k, d: events.append((k, d)))
+        res = ag.send("ORIGINAL REQUEST: map the todo api")
+        self.assertIsNone(res["error"])
+        self.assertGreaterEqual(res["compactions"], 1)
+        self.assertGreaterEqual(llm.summaries, 1)
+        kinds = [k for k, _ in events]
+        self.assertIn("compaction", kinds)
+        comp = next(d for k, d in events if k == "compaction")
+        self.assertLess(comp["after"], comp["before"])
+        # the live context: system, then the continuation carrying the original request + summary
+        self.assertEqual(ag.messages[0]["content"], "SYSTEM")
+        self.assertIn("ORIGINAL REQUEST: map the todo api", ag.messages[1]["content"])
+        self.assertIn("SUMMARY-", ag.messages[1]["content"])
+        self.assertIn("recall", ag.messages[1]["content"])
+        for m in ag.messages:  # no orphaned tool results
+            if m["role"] == "tool":
+                ids = {tc["id"] for x in ag.messages if x.get("tool_calls") for tc in x["tool_calls"]}
+                self.assertIn(m["tool_call_id"], ids)
+        # everything is still in the transcript, verbatim, and recall returns it
+        recs = [json.loads(x) for x in (tmp / "messages.jsonl").read_text().splitlines()]
+        t0 = next(r for r in recs if r.get("role") == "tool" and "BEGIN-T0" in r["content"])
+        self.assertIn("END-T0", t0["content"])
+        full = ag.tools["recall"].handler(id=t0["seq"])
+        self.assertIn("BEGIN-T0", full)
+        self.assertIn("END-T0", full)
+        self.assertIn("END-T0", ag.tools["recall"].handler(id=t0["seq"], offset=9000))
+        self.assertIn(f"#{t0['seq']}", ag.tools["recall"].handler(query="BEGIN-T0"))
+        self.assertTrue(any(r.get("type") == "compaction" for r in recs))
+        # resuming rebuilds the compacted context, not the whole history
+        msgs = Agent.load_messages(tmp / "messages.jsonl")
+        self.assertIn("SUMMARY-", msgs[1]["content"])
+        self.assertLess(len(msgs), len([r for r in recs if r.get("role")]))
+        self.assertTrue(all("_seq" in m for m in msgs[1:] if not m.get("_summary")))  # real messages keep their transcript ids
+        self.assertTrue(msgs[1].get("_summary"))
+
+    def test_context_overflow_error_forces_compaction(self) -> None:
+        tmp = Path(tempfile.mkdtemp())
+        tool = Tool("probe", "x", {"type": "object", "properties": {}}, lambda: "data " * 400)
+        err = llmmod.LLMError("context window exceeded", "context_length")
+        err.window = 4000
+        llm = FakeLLM([[("probe", {})], [("probe", {})], [("probe", {})], err, "done"], window=200_000)
+        ag = Agent(llm, [tool], Context(workdir=tmp), "S", tmp / "m.jsonl")
+        res = ag.send("REQ")
+        self.assertIsNone(res["error"])
+        self.assertEqual(llm.context_window, 4000)  # learned from the error
+        self.assertGreaterEqual(res["compactions"], 1)
+
+    def test_mechanical_compaction_when_summary_fails(self) -> None:
+        tmp = Path(tempfile.mkdtemp())
+        tool = Tool("probe", "x", {"type": "object", "properties": {}}, lambda: "row " * 900)
+
+        class NoSummary(FakeLLM):
+            def chat(self, messages, tools=None, **kw):  # noqa: ANN001
+                if tools is None:
+                    raise llmmod.LLMError("summary model down", "network")
+                return super().chat(messages, tools, **kw)
+
+        llm = NoSummary([[("probe", {})] for _ in range(6)] + ["done"], window=6000)
+        ag = Agent(llm, [tool], Context(workdir=tmp), "S", tmp / "m.jsonl")
+        res = ag.send("REQ-MECH")
+        self.assertIsNone(res["error"])
+        self.assertGreaterEqual(res["compactions"], 1)
+        self.assertIn("REQ-MECH", ag.messages[1]["content"])
+        self.assertIn("recall", json.dumps(ag.messages))
+
+    def test_markdown_and_wrapping(self) -> None:
+        old = termmod.COLOR
+        try:
+            termmod.COLOR = 0
+            out = termmod.render_markdown("# Title\n\nSome **bold** and `code` [docs](https://x.dev).\n\n- one\n- two\n\n```python\ndef f():\n    return 1\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |", 60)
+            text = "\n".join(out)
+            for want in ("Title", "Some bold and code docs (https://x.dev).", "• one", "def f():", "╭─ python", "│ a │ b │", "│ 1 │ 2 │"):
+                self.assertIn(want, text)
+            termmod.COLOR = 24
+            styled = termmod.inline("a **bold** word and `x` " * 12)
+            lines = termmod.wrap(styled, 40, "   ", "   ")
+            self.assertGreater(len(lines), 3)
+            self.assertTrue(all(termmod.vis_len(x) <= 40 for x in lines))
+            self.assertEqual(termmod.vis_len(termmod.truncate(termmod.sty("x" * 100, "#ff0000"), 20)), 20)
+            self.assertEqual(termmod.vis_len("日本"), 4)
+            hl = termmod.highlight('def fetch(url: str) -> dict:  # get "x"', "python")
+            self.assertIn("\x1b[", hl)
+            self.assertEqual(termmod.strip_ansi(hl), 'def fetch(url: str) -> dict:  # get "x"')
+            narrow = termmod.render_markdown("| endpoint | method | auth | notes |\n|---|---|---|---|\n| /api/todos/list/all | GET | cookie sid | paginated with cursor |", 40)
+            self.assertTrue(any("endpoint:" in termmod.strip_ansi(x) for x in narrow))  # phone-width table fallback
+        finally:
+            termmod.COLOR = old
+
+    def test_reporter_renders_a_session(self) -> None:
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        stream = io.StringIO()
+        tmp = Path(tempfile.mkdtemp())
+        client = tmp / "api_client.py"
+        client.write_text("import requests\n\n\ndef list_todos():\n    return requests.get('https://x/api/todos').json()\n")
+        with contextlib.redirect_stderr(buf):
+            rep = Reporter(json_stream=stream)
+            rep.run_header("agent", "abc123", "nvidia/stepfun-ai/step-5-preview", "python")
+            rep("thinking_start", {"turn": 1})
+            rep("thinking_delta", {"text": "I should open the page first."})
+            rep("text_delta", {"text": "Opening the **site** now.\n"})
+            rep("thinking", {"text": "I should open the page first."})
+            rep("text", {"text": "Opening the **site** now."})
+            rep("tool_start", {"name": "browser_navigate", "input": {"url": "https://example.com/app"}})
+            rep("tool_end", {"name": "browser_navigate", "is_error": False, "duration_ms": 5, "output": "200 GET https://example.com/api/todos\nline2\nline3\nline4"})
+            rep("retry", {"attempt": 2, "max": 39, "wait": 3.0, "reason": "HTTP 503 from provider"})
+            rep("compaction", {"before": 150000, "after": 30000, "window": 200000, "method": "summary", "count": 1})
+            rep("tool_start", {"name": "write_file", "input": {"path": "api_client.py", "content": client.read_text()}})
+            rep("usage", {"input_tokens": 1200, "output_tokens": 300, "requests": 3, "estimated_cost_usd": 0.01})
+            rep.card(client, "nvidia/stepfun-ai/step-5-preview")
+            rep.footer()
+        out = termmod.strip_ansi(buf.getvalue())
+        for want in (
+            "run abc123",
+            "thought for",
+            "I should open the page first.",
+            "Opening the site now.",
+            "01  navigate",
+            "└ 200 GET",
+            "+1 lines",
+            "retry 2/39",
+            "150.0k →",
+            "150.0k → 30.0k",
+            "02  write",
+            "def list_todos",
+            "api_client.py ready",
+        ):
+            self.assertIn(want, out)
+        self.assertEqual(out.count("Opening the site now."), 1)  # streamed text is not printed twice
+        ev = [json.loads(x)["event"] for x in stream.getvalue().splitlines()]
+        for want in ("thinking", "text", "tool_start", "tool_end", "retry", "compaction"):
+            self.assertIn(want, ev)
 
     @unittest.skipUnless(SAMPLE_HAR.exists(), "sample HAR not present")
     def test_har_tools_on_real_capture(self) -> None:

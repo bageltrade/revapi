@@ -20,7 +20,7 @@ from .browser import Browser, find_chromium, is_api_like
 from .llm import LLM, LLMError  # noqa: F401  (LLM re-exported for cli)
 from .prompts import load
 from .tools import Context, browser_tools, collector_tools, control_tools, file_tools, har_tools, web_tools
-from .ui import Reporter, bold, cyan, dim, green, red, yellow
+from .ui import Reporter, bold, cyan, dim, green, red, suspended, yellow
 
 SCHEMA_VERSION = 1
 
@@ -89,17 +89,34 @@ def ask_note(interactive: bool) -> str:
 
 def make_llm(cfg: store.Config, model: str | None = None, collector: bool = False) -> LLM:
     m = model or (cfg.get("collector_model") if collector else None) or cfg.get("model")
-    return LLM(provider=cfg.get("provider", "auto"), model=m, api_key=cfg.get("api_key"), base_url=cfg.get("base_url"), effort=cfg.get("effort"))
+    return LLM(
+        provider=cfg.get("provider", "auto"),
+        model=m,
+        api_key=cfg.get("api_key"),
+        base_url=cfg.get("base_url"),
+        effort=cfg.get("effort"),
+        stream=False if os.environ.get("REVAPI_NO_STREAM") else bool(cfg.get("stream", True)),
+        retries=int(os.environ.get("REVAPI_RETRIES") or cfg.get("retries", 40)),
+        context=int(os.environ.get("REVAPI_CONTEXT_WINDOW") or 0) or cfg.get("context_window"),
+        max_tokens=cfg.get("max_tokens", 16000),
+    )
+
+
+def _setup_rep(rep: Reporter, cfg: store.Config, mode: str) -> None:
+    rep.mode = mode
+    if getattr(rep, "show_thinking", None) is not None and (cfg.get("show_thinking") is False or os.environ.get("REVAPI_HIDE_THINKING")):
+        rep.show_thinking = False
 
 
 def terminal_ask(question: str, options: list[str] | None) -> str:
-    print(f"\n{bold('?')} {question}", file=sys.stderr)
-    for i, o in enumerate(options or [], 1):
-        print(f"  {i}. {o}", file=sys.stderr)
-    try:
-        ans = input("> ").strip()
-    except EOFError:
-        return ""
+    with suspended():
+        print(f"\n {yellow('?')} {bold(question)}", file=sys.stderr)
+        for i, o in enumerate(options or [], 1):
+            print(f"     {dim(str(i) + '.')} {o}", file=sys.stderr)
+        try:
+            ans = input(f" {yellow('›')} ").strip()
+        except EOFError:
+            return ""
     if options and ans.isdigit() and 1 <= int(ans) <= len(options):
         return options[int(ans) - 1]
     return ans
@@ -169,7 +186,8 @@ def run_agent(
     hist = store.History()
     hist.upsert(store.make_record(run_id, "agent", prompt, llm.describe(), url, output_dir, output_mode=cg.mode, output_language=cg.language, provider=llm.provider))
     rep.emit("run_started", run_id=run_id, mode="agent", model=llm.describe(), har_path=str(har), scripts_dir=str(scripts))
-    rep.log(f"{bold('revapi agent')} {dim(run_id)} · {llm.describe()} · {cg.name if not cg.docs else 'OpenAPI docs'}")
+    _setup_rep(rep, cfg, "agent")
+    rep.run_header("agent", run_id, llm.describe(), cg.name if not cg.docs else "OpenAPI docs")
     ctx = Context(
         workdir=scripts,
         har_path=har,
@@ -183,7 +201,7 @@ def run_agent(
     system = load("agent_system", codegen_instructions=cg.instructions(), output_files=cg.output_files(), ask_user_note=ask_note(interactive))
     user = load("agent_user", prompt=prompt, start_url_block=f"\n<start_url>\n{url}\n</start_url>\n" if url else "", scripts_dir=scripts, har_path=har)
     tools = browser_tools(ctx) + har_tools(ctx) + file_tools(ctx) + web_tools(ctx) + control_tools(ctx)
-    agent = Agent(llm, tools, ctx, system, store.messages_path(run_id, output_dir), rep, cfg.get("max_turns", 120))
+    agent = Agent(llm, tools, ctx, system, store.messages_path(run_id, output_dir), rep, cfg.get("max_turns", 120), compact_at=float(os.environ.get("REVAPI_COMPACT_AT") or 0) or cfg.get("compact_at"))
     if keep is not None:
         keep.update(agent=agent, ctx=ctx, run_id=run_id, mode="agent", cg=cg, output_dir=output_dir)
     syncer = _start_sync(cfg, scripts, prompt, rep)
@@ -197,6 +215,8 @@ def run_agent(
     if not result.get("error") and not result["script_path"]:
         result["error"], result["error_kind"] = f"the agent finished without writing a client in {scripts}", "engine_failure"
     _finish_record(hist, run_id, result, {"paths": {"har_path": str(har) if har.exists() else None, "script_path": result["script_path"], "local_path": str(syncer.dst) if syncer else None}})
+    if not result.get("error"):
+        rep.card(result["script_path"], llm.describe())
     rep.footer()
     return payload("agent", run_id, prompt, result, url=url, har_path=str(har) if har.exists() else None, local_path=str(syncer.dst) if syncer else None, model=llm.describe())
 
@@ -247,7 +267,8 @@ def run_engineer(
     hist.update(run_id, status="running", model=llm.describe(), last_engineered=time.strftime("%Y-%m-%dT%H:%M:%S"))
     rep.emit("run_started", run_id=run_id, mode="engineer", model=llm.describe(), har_path=str(har), scripts_dir=str(scripts))
     n_entries = len(harlib.load(har))
-    rep.log(f"{bold('revapi engineer')} {dim(run_id)} · {llm.describe()} · {n_entries} HAR entries")
+    _setup_rep(rep, cfg, "engineer")
+    rep.run_header("engineer", run_id, llm.describe(), f"{n_entries} HAR entries")
     ctx = Context(workdir=scripts, har_path=har, interactive=interactive, shell_timeout=cfg.get("shell_timeout", 180), ask=terminal_ask)
     attempt = (
         ""
@@ -292,7 +313,7 @@ def run_engineer(
         existing_artifact="documentation" if cg.docs else "script",
     )
     tools = har_tools(ctx) + file_tools(ctx) + [t for t in web_tools(ctx) if t.name == "web_fetch"] + control_tools(ctx)
-    agent = Agent(llm, tools, ctx, system, store.messages_path(run_id, output_dir), rep, cfg.get("max_turns", 120))
+    agent = Agent(llm, tools, ctx, system, store.messages_path(run_id, output_dir), rep, cfg.get("max_turns", 120), compact_at=float(os.environ.get("REVAPI_COMPACT_AT") or 0) or cfg.get("compact_at"))
     if keep is not None:
         keep.update(agent=agent, ctx=ctx, run_id=run_id, mode="engineer", cg=cg, output_dir=output_dir)
     syncer = _start_sync(cfg, scripts, main_prompt or run_id, rep)
@@ -305,6 +326,8 @@ def run_engineer(
     if not result.get("error") and not result["script_path"]:
         result["error"], result["error_kind"] = f"engineering finished without writing output in {scripts}", "engine_failure"
     _finish_record(hist, run_id, result, {"paths": {"har_path": str(har), "script_path": result["script_path"], "local_path": str(syncer.dst) if syncer else None}})
+    if not result.get("error"):
+        rep.card(result["script_path"], llm.describe())
     rep.footer()
     return payload("engineer", run_id, prompt, result, fresh=fresh, har_path=str(har), local_path=str(syncer.dst) if syncer else None, model=llm.describe())
 
@@ -424,7 +447,8 @@ def run_manual(
         headed = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")) and not cfg.get("headless_manual", False)
     hist = store.History()
     hist.upsert(store.make_record(run_id, "manual", prompt or "", "-", url, output_dir, output_mode=cfg.get("output_mode"), output_language=cfg.get("output_language")))
-    rep.log(f"{bold('revapi manual')} {dim(run_id)} · {'headed window' if headed else 'headless (command shell)'}")
+    _setup_rep(rep, cfg, "manual")
+    rep.run_header("manual", run_id, "headed window" if headed else "headless (command shell)")
     har = capture_manual(cfg, rep, url, run_id, output_dir, headed)
     entries = harlib.load(har)
     n_api = len(harlib.api_indices(entries))
@@ -455,10 +479,20 @@ def run_collector(prompt: str, cfg: store.Config, rep: Reporter, model: str | No
     hist = store.History()
     hist.upsert(store.make_record(run_id, "collector", prompt, llm.describe(), None, output_dir, provider=llm.provider))
     rep.emit("run_started", run_id=run_id, mode="collector", model=llm.describe(), output_dir=str(out))
-    rep.log(f"{bold('revapi collector')} {dim(run_id)} · {llm.describe()}")
+    _setup_rep(rep, cfg, "collector")
+    rep.run_header("collector", run_id, llm.describe())
     ctx = Context(workdir=out, har_path=store.har_path(run_id, output_dir), items_path=items, interactive=interactive, ask=terminal_ask, headless=True)
     tools = web_tools(ctx) + collector_tools(ctx) + browser_tools(ctx) + [t for t in file_tools(ctx) if t.name in ("read_file", "shell")] + control_tools(ctx)
-    agent = Agent(llm, tools, ctx, load("collector_system"), store.messages_path(run_id, output_dir), rep, cfg.get("max_turns", 120))
+    agent = Agent(
+        llm,
+        tools,
+        ctx,
+        load("collector_system"),
+        store.messages_path(run_id, output_dir),
+        rep,
+        cfg.get("max_turns", 120),
+        compact_at=float(os.environ.get("REVAPI_COMPACT_AT") or 0) or cfg.get("compact_at"),
+    )
     if keep is not None:
         keep.update(agent=agent, ctx=ctx, run_id=run_id, mode="collector", output_dir=output_dir)
     try:
@@ -639,7 +673,17 @@ def resume(run_id: str, cfg: store.Config, rep: Reporter, model: str | None = No
         proxy=cfg.get("proxy"),
         user_data_dir=cfg.get("user_data_dir"),
     )
-    agent = Agent(make_llm(cfg, model, collector=mode == "collector"), tools_for(mode, ctx), ctx, "", mp, rep, cfg.get("max_turns", 120), messages=msgs)
+    agent = Agent(
+        make_llm(cfg, model, collector=mode == "collector"),
+        tools_for(mode, ctx),
+        ctx,
+        "",
+        mp,
+        rep,
+        cfg.get("max_turns", 120),
+        messages=msgs,
+        compact_at=float(os.environ.get("REVAPI_COMPACT_AT") or 0) or cfg.get("compact_at"),
+    )
     cg = Codegen(rec.get("output_language") or cfg.get("output_language"), rec.get("output_mode") or cfg.get("output_mode"), scripts)
     return {"agent": agent, "ctx": ctx, "run_id": run_id, "mode": mode, "cg": cg, "output_dir": output_dir}
 
@@ -649,6 +693,9 @@ def follow_up(keep: dict, text: str, rep: Reporter) -> dict:
     agent: Agent = keep["agent"]
     ctx: Context = keep["ctx"]
     ctx.finished = None
+    rep.mode = keep["mode"] if keep["mode"] in ("agent", "engineer", "collector", "manual") else "agent"
+    rep.model = agent.llm.describe()
+    agent.on_event = rep
     hist = store.History()
     hist.update(keep["run_id"], status="running")
     try:
@@ -666,6 +713,8 @@ def follow_up(keep: dict, text: str, rep: Reporter) -> dict:
     prev = (hist.get(keep["run_id"]) or {}).get("usage") or {}
     total = {k: (prev.get(k) or 0) + (v or 0) for k, v in result["usage"].items() if isinstance(v, (int, float))}
     _finish_record(hist, keep["run_id"], {**result, "usage": total})
+    if not result.get("error") and keep["mode"] != "collector":
+        rep.card(result["script_path"], agent.llm.describe())
     rep.footer()
     return payload(keep["mode"], keep["run_id"], text, result)
 

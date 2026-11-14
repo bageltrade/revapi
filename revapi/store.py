@@ -64,6 +64,12 @@ DEFAULTS: dict[str, Any] = {
     "shell_timeout": 180,
     "proxy": None,
     "user_data_dir": None,  # persistent Chromium profile (keeps logins between runs)
+    "stream": True,  # stream replies token by token
+    "retries": 40,  # attempts per model request before giving up (network drops, 429, 5xx, overloads…)
+    "context_window": None,  # None -> known size for the model (128k if unknown); set to override
+    "compact_at": 0.8,  # compact the conversation when it fills this share of the context window
+    "show_thinking": True,  # show the model's reasoning (folded) in the margin
+    "max_tokens": 16000,  # output tokens per reply (lowered automatically if a model caps it)
 }
 
 
@@ -100,6 +106,12 @@ class Config:
             raise ValueError(f"output_language must be one of {', '.join(LANGUAGES)}")
         if key == "output_mode" and value not in ("client", "docs"):
             raise ValueError("output_mode must be client or docs")
+        if key == "compact_at" and value is not None:
+            value = float(value)
+            if not 0.3 <= value <= 0.95:
+                raise ValueError("compact_at must be between 0.3 and 0.95")
+        if key in ("retries", "context_window", "max_tokens") and value is not None and (not isinstance(value, int) or value < 1):
+            raise ValueError(f"{key} must be a positive integer")
         if key == "effort" and value not in (None, "low", "medium", "high"):
             raise ValueError("effort must be low, medium, high or none")
         self.data[key] = value

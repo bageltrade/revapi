@@ -18,7 +18,8 @@ from . import __version__, modes, store
 from . import har as harlib
 from .browser import find_chromium
 from .llm import PROVIDERS, LLMError, detect_provider
-from .ui import Reporter, bold, cyan, dim, green, red, yellow
+from . import term as T
+from .ui import LAST_THINKING, Reporter, bold, cyan, dim, green, red, yellow
 
 MODES = ("agent", "manual", "engineer", "collector")
 URL_RE = re.compile(r"https?://[^\s'\"<>]+|\b(?:[a-z0-9-]+\.)+(?:com|net|org|io|ai|app|dev|co|xyz|me|tv|gg|so|sh|ng|uk|de|fr)(?:/[^\s]*)?\b", re.I)
@@ -38,7 +39,7 @@ def _reporter(args: argparse.Namespace) -> Reporter:
         return Reporter(quiet=True, json_stream=sys.stdout, verbose=False)
     if getattr(args, "json", False):
         return Reporter(quiet=True)
-    return Reporter(verbose=getattr(args, "verbose", False))
+    return Reporter(verbose=getattr(args, "verbose", False), show_thinking=store.Config().get("show_thinking", True) is not False)
 
 
 def _interactive(args: argparse.Namespace) -> bool:
@@ -49,16 +50,19 @@ def _finish(res: dict, args: argparse.Namespace, rep: Reporter) -> int:
     if getattr(args, "json", False) or getattr(args, "json_stream", False):
         _out(res, getattr(args, "json_stream", False))
     else:
-        if res.get("summary"):
-            print("\n" + res["summary"].strip())
+        if res.get("summary") and not (sys.stdout.isatty() and getattr(rep, "summary_shown", False)):
+            print("\n" + res["summary"].strip())  # piped output gets the plain summary
         if res.get("error"):
-            print(red(f"\n✗ {res['error']}"), file=sys.stderr)
+            print(f"\n {T.sty('!', T.PINK, bold=True)}  {red(str(res['error']))}", file=sys.stderr)
+            if res.get("error_kind") in ("network", "rate_limit", "engine_failure", "interrupted", "max_turns") and res.get("run_id"):
+                print(dim(f"    nothing is lost — continue with: revapi   then /resume {res['run_id']}"), file=sys.stderr)
         else:
             for k in ("script_path", "local_path", "har_path"):
                 if res.get(k):
-                    print(f"{green('✓')} {k.replace('_', ' ')}: {res[k]}", file=sys.stderr)
+                    label = {"script_path": "client", "local_path": "copy", "har_path": "capture"}[k]
+                    print(f"   {T.sty('└', T.HAIRLINE)} {T.sty(f'{label:<7}', T.DIM)} {T.sty(T.link(str(res[k]), Path(str(res[k])).resolve().as_uri()), T.INK_SOFT)}", file=sys.stderr)
             if res.get("run_id") and res.get("mode") != "collector":
-                print(dim(f'  run it: revapi run {res["run_id"]}   ·   refine: revapi engineer {res["run_id"]} -p "..."'), file=sys.stderr)
+                print(dim(f'\n   run it: revapi run {res["run_id"]}  ·  refine: revapi engineer {res["run_id"]} -p "..."'), file=sys.stderr)
     return 1 if res.get("error") else 0
 
 
@@ -336,6 +340,9 @@ REPL_COMMANDS = {
     "/resume": "a past run's conversation, to continue it (/resume <run_id>)",
     "/engineer": "re-engineer a past run (/engineer <run_id> [instructions])",
     "/run": "run the latest client (/run [run_id] [args])",
+    "/thinking": "the model's full reasoning from the last reply",
+    "/context": "how full the context window is",
+    "/compact": "summarize the conversation now (full history stays recallable)",
     "/output": "everything from this session, unfolded",
     "/open": "open the latest client",
     "/clear": "clear the conversation and start over",
@@ -361,6 +368,35 @@ Type a request to start (include a URL to set the start page). Follow-up message
 )
 
 
+def _banner(cfg: store.Config, mode: str, desc: str) -> None:
+    a = T.MODE_COLORS.get(mode, T.PINK)
+    lang = cfg.get("output_language") + (" (docs)" if cfg.get("output_mode") == "docs" else "")
+    effort = cfg.get("effort")
+    print(file=sys.stderr)
+    print(
+        f" {T.sty('*', T.PINK, bold=True)} {T.sty('revapi', T.INK, bold=True)}  {T.sty('v' + __version__, T.DIM)}   {T.sty('turn websites into', T.INK_SOFT)} {T.sty('APIs', T.PINK, italic=True)}",
+        file=sys.stderr,
+    )
+    print(f"   {T.sty(' · '.join(x for x in (desc, 'effort ' + effort if effort else '', lang) if x), T.DIM)}", file=sys.stderr)
+    print(file=sys.stderr)
+    print(f"   {T.sty('describe the API you want · / for commands · mode', T.DIM)} {T.sty(mode, a, italic=True)}", file=sys.stderr)
+
+
+def _prompt(mode: str, model: str) -> str:
+    """The seam above the input (mode left, model right) and the › marker; escapes wrapped for readline."""
+    a = T.MODE_COLORS.get(mode, T.PINK)
+    w = T.cols()
+    left = f" ┄┄ {mode} "
+    right = f" {model} ┄┄"
+    fill = max(1, w - len(left) - len(right) - 1)
+    seam = T.sty(" ┄┄ ", T.HAIRLINE) + T.sty(mode, a, italic=True) + " " + T.sty("┄" * fill, T.HAIRLINE) + " " + T.sty(model, T.INK_SOFT) + T.sty(" ┄┄", T.HAIRLINE)
+    marker = T.sty(" › ", a, bold=True)
+    if T.COLOR:
+        marker = re.sub(r"(\x1b\[[0-9;]*m)", "\x01\\1\x02", marker)
+    print("\n" + seam, file=sys.stderr)
+    return marker
+
+
 def repl(cfg: store.Config) -> int:
     try:
         import readline  # noqa: F401  (history + line editing where available)
@@ -381,12 +417,15 @@ def repl(cfg: store.Config) -> int:
     try:
         desc = modes.make_llm(cfg).describe()
     except LLMError as e:
-        desc = red(f"no model ({e})")
-    print(f"{bold('revapi')} {__version__} · {desc} · mode {cyan(mode)} · {cfg.get('output_language')}{' (docs)' if cfg.get('output_mode') == 'docs' else ''}")
-    print(dim("type a request, or /help"))
+        desc = f"no model ({e})"
+    _banner(cfg, mode, desc)
     while True:
         try:
-            line = input(f"\n{cyan(mode)} {bold('›')} ").strip()
+            short = (modes.make_llm(cfg).model if not desc.startswith("no model") else "no model").split("/")[-1]
+        except LLMError:
+            short = "no model"
+        try:
+            line = input(_prompt(mode, short)).strip()
         except EOFError:
             print()
             return 0
@@ -480,6 +519,33 @@ def repl(cfg: store.Config) -> int:
                 parts = arg.split()
                 rid = parts[0] if parts else (keep.get("run_id") or "latest")
                 modes.run_script(rid, cfg, Reporter(), args=parts[1:], interactive=True)
+            elif cmd == "/thinking":
+                text = LAST_THINKING[0]
+                if text:
+                    for ln in T.render_markdown(text, T.cols() - 1, "      " + T.sty("┊", T.HAIRLINE) + " "):
+                        print(T.sty(T.strip_ansi(ln), T.DIM, italic=True) if T.COLOR else ln, file=sys.stderr)
+                else:
+                    print(dim("   no reasoning yet — models that think show it here (try /effort high)"))
+            elif cmd in ("/context", "/compact"):
+                ag = keep.get("agent")
+                if not ag:
+                    print(dim("   no conversation yet"))
+                else:
+                    if cmd == "/compact":
+                        rep = Reporter(mode=mode)
+                        ag.on_event = rep
+                        _safe(lambda: ag.maybe_compact([t.schema() for t in ag.tools.values()], force=True))
+                        rep.stop()
+                    used, win = ag.context_tokens([t.schema() for t in ag.tools.values()]), ag._window()
+                    pct = round(100 * used / win) if win else 0
+                    bar_w = 24
+                    fill = min(bar_w, round(bar_w * used / win)) if win else 0
+                    color = T.MINT if pct < 60 else T.AMBER if pct < 80 else T.PINK
+                    print(f"   {T.sty('▰' * fill, color)}{T.sty('▱' * (bar_w - fill), T.HAIRLINE)}  {T.sty(f'{T.k(used)} / {T.k(win)}', T.INK)} {T.sty(f'tokens · {pct}%', T.DIM)}", file=sys.stderr)
+                    print(
+                        T.truncate(T.sty(f"   compacts at {int(ag.compact_at * 100)}% · {ag.compactions} compacted · {len(ag.messages)} messages live · full history recallable", T.DIM), T.cols() - 1),
+                        file=sys.stderr,
+                    )
             elif cmd == "/output":
                 for r in session:
                     print(json.dumps(r, indent=2, ensure_ascii=False, default=str))
@@ -502,7 +568,7 @@ def repl(cfg: store.Config) -> int:
             continue
 
         # ---- a request
-        rep = Reporter()
+        rep = Reporter(mode=mode, show_thinking=cfg.get("show_thinking", True) is not False)
         if keep.get("agent"):
             res = _safe(lambda: modes.follow_up(keep, line, rep))
         elif mode == "agent":
@@ -517,8 +583,9 @@ def repl(cfg: store.Config) -> int:
             res = _safe(lambda: modes.run_engineer(rid, cfg, rep, prompt=extra, interactive=True, keep=keep)) if rid else {"error": "no runs to engineer yet"}
         else:
             res = _safe(lambda: modes.run_collector(line, cfg, rep, interactive=True, keep=keep))
+        rep.stop()
         session.append(res)
-        _show(res)
+        _show(res, shown=rep.summary_shown)
 
 
 def _safe(fn) -> dict:  # noqa: ANN001
@@ -532,14 +599,19 @@ def _safe(fn) -> dict:  # noqa: ANN001
         return {"status": "error", "error": f"{type(e).__name__}: {e}", "error_kind": "unknown"}
 
 
-def _show(res: dict) -> None:
-    if res.get("summary"):
-        print("\n" + res["summary"].strip())
+def _show(res: dict, shown: bool = False) -> None:
+    """A run's outcome in the conversation: the summary as Markdown (unless already shown), then where its files are."""
+    if res.get("summary") and not shown:
+        lines = T.render_markdown(res["summary"].strip(), T.cols() - 1, "   ", f" {T.sty('¶', T.PINK)} ")
+        print("\n".join(lines), file=sys.stderr)
     if res.get("error"):
-        print(red(f"✗ {res['error']}"))
+        print(f"\n {T.sty('!', T.PINK, bold=True)}  {T.sty(str(res['error'])[:2000], T.PINK)}", file=sys.stderr)
+        if res.get("error_kind") in ("network", "rate_limit", "engine_failure", "interrupted") and res.get("run_id"):
+            print(f"    {dim('nothing is lost — type a follow-up or /resume ' + str(res['run_id']) + ' to continue')}", file=sys.stderr)
     for k in ("script_path", "local_path", "har_path"):
         if res.get(k):
-            print(f"{green('✓')} {k.replace('_', ' ')}: {res[k]}")
+            label = {"script_path": "client", "local_path": "copy", "har_path": "capture"}[k]
+            print(f"   {T.sty('└', T.HAIRLINE)} {T.sty(f'{label:<7}', T.DIM)} {T.sty(T.link(str(res[k]), Path(str(res[k])).resolve().as_uri()), T.INK_SOFT)}", file=sys.stderr)
 
 
 def _pick(label: str, options: list[str], current: str | None) -> str:
@@ -651,7 +723,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
+    argv = list(sys.argv[1:] if argv is None else argv)
+    passthrough: list[str] = []
+    if argv[:1] == ["run"] and "--" in argv:  # everything after -- goes to the script (argparse differs across Python versions)
+        i = argv.index("--")
+        argv, passthrough = argv[:i], argv[i + 1 :]
     args = parser.parse_args(argv)
+    if passthrough:
+        args.args = list(getattr(args, "args", None) or []) + passthrough
     if args.json_schema_version:
         print(modes.SCHEMA_VERSION)
         return 0

@@ -6,6 +6,9 @@ Turn any website into a working API client from your terminal (including **Termu
 
 - **Pure Python standard library.** No pip dependencies, no Playwright, no Node.
 - **Talks to Chromium directly** over the DevTools Protocol, using its own small WebSocket client.
+- **Streams everything live.** Watch the model think (folded ┊ notes), see its reply typed out as Markdown, and follow each tool call as it happens, all in an RAE-style ledger with a boarding-pass card at the end.
+- **Never gives up on a flaky network.** Every model request retries up to **40 times**. Waits back off (1.5s doubling, capped at 60s, with jitter), honour `Retry-After`, and resume a stream that drops mid-reply.
+- **Auto-compacts long sessions with nothing lost.** At 80% of the model's context window, older turns are summarized. Every message stays verbatim on disk, and the agent can `recall` any of it by id or regex.
 - **Works with almost any LLM.** Anthropic, OpenAI, OpenRouter, Gemini, **NVIDIA NIM**, Groq, DeepSeek, Mistral, xAI, Together, Cerebras and OpenCode are supported. So are local models through Ollama or LM Studio, any OpenAI-compatible URL, and a free keyless fallback.
 
 revapi is a from-scratch rebuild of [reverse-api-engineer](https://github.com/kalil0321/reverse-api-engineer) (MIT) with the same modes, commands and outputs. Its code-generation prompt partials are adapted from that project.
@@ -145,6 +148,9 @@ Run `revapi` with no arguments. Type a request; if it contains a URL, that becom
 | `/engineer` | `/engineer <id> [instructions]` re-engineers a past run |
 | `/run` | Run the latest client |
 | `/open` | Open the latest client |
+| `/thinking` | The model's full reasoning from the last reply |
+| `/context` | How full the context window is (gauge, compactions, live messages) |
+| `/compact` | Summarize the conversation now; the full history stays recallable |
 | `/output` | Show everything from this session |
 | `/new` | Start a new run |
 | `/clear` | Clear the session and start over |
@@ -152,6 +158,46 @@ Run `revapi` with no arguments. Type a request; if it contains a URL, that becom
 | `/exit` | Quit |
 
 Ctrl-C interrupts the agent; Ctrl-D quits.
+
+### What you see
+
+```
+ * agent  run be4383f2d1be  nvidia/stepfun-ai/step-5-preview · Python
+
+   ◇ HTTP 503 from provider  retry 1/40 in 2s
+      ┊ thought for 4s
+      ┊ The user wants the todo API. I should open the start page, interact with the form so
+      ┊ the app fires its requests, then read the captured traffic.
+
+ ¶ I'll open the site and capture its traffic.
+
+ * 01  navigate  https://example.com/
+               └ loaded https://example.com/ (title: Todo)
+                 +6 lines
+ * 02  network   api requests
+               └ #1 GET https://example.com/api/todos -> 200 application/json 40B
+ * 03  write     api_client.py
+               10 def list_todos() -> list[dict]:
+               11     r = requests.get(f"{BASE}/api/todos", headers=HEADERS, cookies=COOKIES…
+   ◇ context compacted  152.0k → 41.3k  · summarized · nothing lost
+ * 04  run       python3 api_client.py
+               └ [exit 0]
+
+ ╭─ client ─────────────────┬──────────────────╮
+ │  * api_client.py ready   ┊  step-5-preview  │
+ │    python · 26 lines     ┊  6 requests      │
+ │    10.6k tokens · $0.00  ┊  48s             │
+ ╰──────────────────────────┴──────────────────╯
+```
+
+While the agent works, a live status line shows a split-flap verb (*reading*, *writing*, …), a packet travelling `host ┄┄▪┄┄ client`, elapsed time, tokens, context % and cost. When stdout is not a terminal (pipes, CI, `--json`), the live line and streaming switch off automatically.
+
+### Reliability and context
+
+- **Retries.** Network errors, timeouts, 408/409/425/429/5xx, overloaded errors and streams cut mid-reply are all retried, up to `retries` times (default 40). Auth errors (401/403) fail immediately with a clear message. If a provider rejects an optional field (`stream_options`, `chat_template_kwargs`, …), revapi drops that field and tries again.
+- **Context windows.** These are known for common models (Claude 200k, Kimi K2.6 256k, GPT-4.1 1M, Gemini 1M, …), or you can set `context_window`. If a provider says a request is too long, revapi learns the real limit from the error, compacts and continues.
+- **Compaction.** Older turns are summarized by the model into a structured working memory: the request, the API surface found so far, auth, files and the next step. If that fails, revapi falls back to shortening old outputs into recallable pointers. The latest exchange always stays verbatim. A compaction that would not shrink anything is skipped.
+- **Nothing lost.** `runs/messages/<run_id>.jsonl` keeps every message with a sequence number, plus a snapshot at each compaction. `/resume` restarts from the latest snapshot, and the agent's `recall` tool reads any original message back.
 
 ---
 
@@ -216,6 +262,12 @@ Ctrl-C interrupts the agent; Ctrl-D quits.
 | `proxy` | – | e.g. `http://127.0.0.1:8080` |
 | `max_turns` | `120` | Agent step limit |
 | `shell_timeout` | `180` | Seconds allowed per shell command |
+| `stream` | `true` | Stream replies, thinking and tool calls live |
+| `retries` | `40` | Retries per model request (network errors, 429/5xx, dropped streams) |
+| `context_window` | auto | Context window in tokens (auto-detected for known models) |
+| `compact_at` | `0.8` | Compact when context reaches this share of the window (0.3–0.95) |
+| `show_thinking` | `true` | Show the model's reasoning as folded ┊ notes |
+| `max_tokens` | `16000` | Maximum reply length |
 
 ### Environment variables
 
@@ -225,13 +277,18 @@ Ctrl-C interrupts the agent; Ctrl-D quits.
 | `REVAPI_HOME` | Data directory |
 | `REVAPI_NO_SANDBOX=1` | Always set automatically on Termux and when running as root |
 | `REVAPI_USER_AGENT` | Override the browser's User-Agent |
-| `REVAPI_CONTEXT_CHARS` | Context budget before old tool outputs are compacted |
-| `REVAPI_VERBOSE=1` | Show reasoning and tool output |
-| `NO_COLOR=1` | Disable colored output |
+| `REVAPI_VERBOSE=1` | Show full tool output |
+| `REVAPI_HIDE_THINKING=1` | Hide reasoning notes (`/thinking` still shows them) |
+| `REVAPI_NO_STREAM=1` | Disable streaming |
+| `REVAPI_RETRIES` | Override `retries` |
+| `REVAPI_CONTEXT_WINDOW` / `REVAPI_COMPACT_AT` | Override the context window / compaction threshold |
+| `REVAPI_NO_LIVE=1` | No live status line (plain scrolling output) |
+| `REVAPI_NO_LINKS=1` | No clickable terminal hyperlinks |
+| `NO_COLOR=1` / `REVAPI_NO_COLOR=1` | Disable colored output |
 
 ## JSON output (for scripts and other agents)
 
-`agent`, `engineer`, `collector` and `run` accept `--json`, which prints one object on stdout; logs go to stderr. They also accept `--json-stream`, which emits NDJSON events (`run_started`, `text`, `thinking`, `tool_start`, `tool_end`, …) and then a final line of the form `{"event":"result", ...}`.
+`agent`, `engineer`, `collector` and `run` accept `--json`, which prints one object on stdout; logs go to stderr. They also accept `--json-stream`, which emits NDJSON events (`run_started`, `text`, `thinking`, `tool_start`, `tool_end`, `retry`, `compaction`, …) and then a final line of the form `{"event":"result", ...}`.
 
 Every result has the fields `schema_version`, `status`, `run_id`, `prompt`, `mode`, `script_path`, `summary`, `usage` (tokens and `estimated_cost_usd`), `error` and `error_kind`.
 
@@ -246,7 +303,9 @@ python tests/test_revapi.py        # or: python -m pytest tests -q
 The test suite:
 - launches the real Chromium against a local fixture app;
 - runs the agent, engineer (including docs mode and external HAR input), collector, manual-shell and `--json-stream` pipelines end to end with a scripted model;
-- checks the OpenAI and Anthropic wire formats, throttle handling, config, history and the script runner.
+- checks the OpenAI and Anthropic wire formats, SSE streaming (thinking, text and tool deltas, `<think>` tags, mid-stream errors and drops), the 40-retry logic, Retry-After, context-window detection, summary and fallback compaction with recall and resume, the reporter and Markdown renderer, config, history and the script runner.
+
+`tests/mock_provider.py` is a scripted OpenAI-compatible server that streams thinking and tool calls, fails on purpose (a 503, then a cut stream) and answers compaction requests. Use it to watch the full terminal experience without an API key.
 
 ## Architecture
 
@@ -255,8 +314,11 @@ The test suite:
 | `cdp.py` | RFC 6455 WebSocket client and CDP connection (flattened sessions, events, waiters) |
 | `browser.py` | Chromium discovery and launch, page actions, HAR recorder |
 | `har.py` | HAR overview, search, entry detail and API filter |
-| `llm.py` | OpenAI-compatible and Anthropic clients, retries, usage and cost |
-| `agent.py` | Tool-calling loop, context compaction, transcript log, resume |
+| `llm.py` | OpenAI-compatible and Anthropic clients, SSE streaming, think-tag splitting, 40-retry backoff, context windows, usage and cost |
+| `compaction.py` | Summary prompts, transcript reader, `recall` |
+| `agent.py` | Tool-calling loop, auto compaction, transcript log, resume, event stream |
+| `term.py` | Palette, styling, syntax highlighting, streaming Markdown renderer, live status line |
+| `ui.py` | The reporter: ledger lines, receipts, code previews, diffs, thinking notes, card |
 | `tools.py` | All agent tools |
 | `modes.py` | agent, engineer, manual, collector, run and doctor |
 | `store.py` | Config, run paths, history, script discovery, live sync |
