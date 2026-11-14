@@ -18,7 +18,7 @@ revapi is a from-scratch rebuild of [reverse-api-engineer](https://github.com/ka
 
 ```bash
 pkg update && pkg install -y git
-git clone https://github.com/bageltrade/revapi.git   # private repo: username = bageltrade, password = a GitHub token
+git clone https://github.com/bageltrade/revapi.git
 cd revapi && bash install-termux.sh                   # installs python + chromium (x11-repo) + revapi, runs doctor
 ```
 
@@ -31,10 +31,12 @@ pip install .                 # or run without installing: python -m revapi
 revapi doctor
 ```
 
-Or install a release wheel directly (download it from the repo's Releases page first):
+Or install straight from GitHub without cloning:
 
 ```bash
-pip install revapi-0.1.2-py3-none-any.whl
+pip install git+https://github.com/bageltrade/revapi.git
+# or a release wheel:
+pip install https://github.com/bageltrade/revapi/releases/download/v0.1.2/revapi-0.1.2-py3-none-any.whl
 ```
 
 ### Linux / macOS / WSL
