@@ -133,6 +133,9 @@ SETTINGS = (
     ("api_key", "api key", "secret"),
     ("base_url", "base url", "text"),
     ("proxy", "proxy", "text"),
+    ("keep_session", "keep browser session", "toggle"),
+    ("handoff", "human checks", "choice"),
+    ("handoff_timeout", "live view wait (s)", "text"),
     ("user_data_dir", "browser profile", "text"),
     ("hermes_model", "hermes model", "text"),
     ("hermes_provider", "hermes provider", "text"),
@@ -146,6 +149,11 @@ CHOICES = {
     "engine": [("revapi", "revapi", "the built-in agent, any provider"), ("hermes", "hermes", "the local Hermes CLI engineers saved captures")],
     "output_language": [(lang, lang, "") for lang in store.LANGUAGES],
     "output_mode": [("client", "client", "a working API client"), ("docs", "docs", "an OpenAPI 3.0 spec")],
+    "handoff": [
+        ("auto", "auto", "live view when a terminal is attached"),
+        ("live", "live", "always open the live view so you can pass the check"),
+        ("off", "off", "just report the check and stop"),
+    ],
 }
 SUGGESTIONS = {
     "output_dir": [("", "default", "~/.revapi/runs")],

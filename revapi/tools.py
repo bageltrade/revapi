@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 import urllib.parse
 import urllib.request
@@ -19,6 +20,7 @@ from typing import Any
 
 from . import har as harlib
 from .browser import Browser, CDPError
+from .handoff import hand_off, result_note
 
 MAX_TOOL_OUTPUT = int(os.environ.get("REVAPI_MAX_TOOL_OUTPUT", "14000"))
 
@@ -65,6 +67,26 @@ I = {"type": "integer"}
 B = {"type": "boolean"}
 
 
+def shared_profile(notes: list[str] | None = None) -> str | None:
+    """The saved Chromium profile (~/.revapi/profile): logins and passed checks survive between runs.
+    When another revapi already has it open, this run falls back to a fresh temporary profile."""
+    from .store import app_dir
+
+    d = app_dir() / "profile"
+    lock = d / "SingletonLock"
+    try:
+        target = os.readlink(lock)
+        pid = int(target.rsplit("-", 1)[-1])
+        os.kill(pid, 0)
+        if notes is not None:
+            notes.append("the saved browser profile is in use by another run; using a fresh one")
+        return None
+    except (OSError, ValueError):
+        pass
+    d.mkdir(parents=True, exist_ok=True)
+    return str(d)
+
+
 @dataclass
 class Context:
     """Shared state for one run."""
@@ -84,6 +106,14 @@ class Context:
     screenshots: int = 0
     notes: list[str] = field(default_factory=list)
     prior_entries: list[dict[str, Any]] = field(default_factory=list)
+    keep_session: bool = False  # reuse the saved Chromium profile (~/.revapi/profile) between runs
+    handoff: str = "off"  # live | off | auto — what to do when a page shows a Cloudflare/CAPTCHA check
+    handoff_timeout: float = 600
+    handoff_port: int = 8790
+    handoff_host: str = "127.0.0.1"
+    handoff_open: bool = True  # open the live view link in the phone's browser (termux-open-url)
+    notify: Callable[[str, dict], None] | None = None
+    handoffs: list[dict[str, Any]] = field(default_factory=list)
 
     # -- browser lifecycle ----------------------------------------------------
     def get_browser(self) -> Browser:
@@ -94,9 +124,35 @@ class Context:
                     self.prior_entries = harlib.load(self.har_path)
                 except (OSError, ValueError):
                     self.prior_entries = []
-            self.browser = Browser(headless=self.headless, user_data_dir=self.user_data_dir, proxy=self.proxy)
+            self.browser = Browser(headless=self.headless, user_data_dir=self.profile_dir(), proxy=self.proxy)
             self.browser_closed = False
         return self.browser
+
+    def profile_dir(self) -> str | None:
+        if self.user_data_dir or not self.keep_session:
+            return self.user_data_dir
+        return shared_profile(self.notes)
+
+    def check_challenge(self) -> str:
+        """After a browser action: hand a Cloudflare/CAPTCHA check to the human. '' when clear."""
+        if not self.browser:
+            return ""
+        mode = self.handoff
+        if mode == "auto":
+            mode = "live" if (sys.stdin.isatty() or sys.stderr.isatty()) else "off"
+        res = hand_off(
+            self.browser,
+            self.notify,
+            timeout=self.handoff_timeout,
+            port=self.handoff_port,
+            host=self.handoff_host,
+            open_url=self.handoff_open,
+            live=mode == "live",
+        )
+        if not res:
+            return ""
+        self.handoffs.append(res)
+        return "\n" + result_note(res)
 
     def save_har(self) -> str | None:
         if self.browser and self.har_path:
@@ -138,19 +194,20 @@ def browser_tools(ctx: Context) -> list[Tool]:
 
     def navigate(url: str) -> str:
         r = b().navigate(url)
+        r += ctx.check_challenge()
         return _with_notices(ctx, r + "\n\n" + _clip(b().snapshot(6000), 6500))
 
     def snapshot(max_chars: int = 12000) -> str:
         return _with_notices(ctx, b().snapshot(max_chars))
 
     def click(ref: str) -> str:
-        return _with_notices(ctx, b().click(ref.strip("[]")))
+        return _with_notices(ctx, b().click(ref.strip("[]")) + ctx.check_challenge())
 
     def type_(ref: str, text: str, submit: bool = False, clear: bool = True) -> str:
-        return _with_notices(ctx, b().type(ref.strip("[]"), text, clear=clear, submit=submit))
+        return _with_notices(ctx, b().type(ref.strip("[]"), text, clear=clear, submit=submit) + (ctx.check_challenge() if submit else ""))
 
     def press(key: str) -> str:
-        return _with_notices(ctx, b().press(key))
+        return _with_notices(ctx, b().press(key) + (ctx.check_challenge() if key == "Enter" else ""))
 
     def select(ref: str, value: str) -> str:
         return b().select(ref.strip("[]"), value)
@@ -159,7 +216,7 @@ def browser_tools(ctx: Context) -> list[Tool]:
         return b().scroll(direction, amount)
 
     def back() -> str:
-        return b().back()
+        return b().back() + ctx.check_challenge()
 
     def evaluate(expression: str) -> str:
         v = b().evaluate(expression)

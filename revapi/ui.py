@@ -548,6 +548,34 @@ class Reporter:
             line = f"   {sty('◇', AMBER)} {sty('context compacted', INK_SOFT)}  {sty(T.k(data['before']) + ' →', DIM)} {sty(T.k(data['after']), INK, bold=True)}  {sty(f'· {how} · nothing lost', DIM)}"
             self.out(T.truncate(line, T.cols() - 1))
             return
+        if kind == "handoff":
+            stage = data.get("stage")
+            self.emit("handoff", **{k: v for k, v in data.items() if k != "message"})
+            if stage == "grace":
+                self.out(T.truncate(f"   {sty('◇', AMBER)} {sty(data.get('message', ''), INK_SOFT)}", T.cols() - 1))
+            elif stage == "waiting":
+                t = int(data.get("timeout", 600))
+                mins = f"{t // 60}m" if t >= 60 else f"{t}s"
+                self.out(
+                    "",
+                    f"   {sty('▐ your turn ▌', PINK, bold=True)} {sty(data.get('label', 'human check'), INK, bold=True)} {sty('on ' + T.truncate(data.get('url', ''), 60), DIM)}",
+                    f"      {sty('open', DIM)} {sty(data.get('live_url', ''), SKY, bold=True)}",
+                    f"      {sty(f'it mirrors the browser here · tap the check yourself · revapi carries on once it clears · waits {mins} · esc stops', DIM)}",
+                    "",
+                )
+                self._handoff_prev = (self.verb, self.kind)
+                self.verb, self.kind = "waiting for you in the live view", "other"
+            elif stage == "end":
+                if getattr(self, "_handoff_prev", None):
+                    self.verb, self.kind = self._handoff_prev
+                    self._handoff_prev = None
+                ok = data.get("passed")
+                mark, color = ("✓", MINT) if ok else ("✗", PINK)
+                lines = [T.truncate(f"   {sty(mark, color)} {sty(data.get('label', 'human check'), INK_SOFT)} {sty('· ' + data.get('how', ''), DIM)}", T.cols() - 1)]
+                if ok and data.get("session"):
+                    lines.append(f"      {sty('session saved', DIM)} {sty(data['session'], INK_SOFT)}")
+                self.out(*lines)
+            return
         if kind == "progress":
             self.emit("progress", message=data.get("message", ""))
             self.out(T.truncate(f"   {sty(data.get('message', ''), DIM)}", T.cols() - 1))

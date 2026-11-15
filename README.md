@@ -45,7 +45,7 @@ Or install straight from GitHub without cloning:
 ```bash
 pip install git+https://github.com/bageltrade/revapi.git
 # or a release wheel:
-pip install https://github.com/bageltrade/revapi/releases/download/v0.3.1/revapi-0.3.1-py3-none-any.whl
+pip install https://github.com/bageltrade/revapi/releases/download/v0.3.2/revapi-0.3.2-py3-none-any.whl
 ```
 
 ### Linux / macOS / WSL
@@ -226,6 +226,36 @@ While the agent works, a live status line shows a split-flap verb (*reading*, *w
 - **Compaction.** Older turns are summarized by the model into a structured working memory: the request, the API surface found so far, auth, files and the next step. If that fails, revapi falls back to shortening old outputs into recallable pointers. The latest exchange always stays verbatim. A compaction that would not shrink anything is skipped.
 - **Nothing lost.** `runs/messages/<run_id>.jsonl` keeps every message with a sequence number, plus a snapshot at each compaction. `/resume` restarts from the latest snapshot, and the agent's `recall` tool reads any original message back.
 
+### Cloudflare and CAPTCHA checks (live view)
+
+revapi never solves or works around these checks. You pass them yourself, once, and revapi carries on with the session you got.
+
+1. **Detect.** After every navigation, click or submit, revapi looks for a Cloudflare page ("Just a moment…"), an unsolved Turnstile widget, hCaptcha or reCAPTCHA.
+2. **Wait a moment.** Most checks clear on their own in a real browser within a few seconds. If that happens, nothing else is shown.
+3. **Hand off.** If the check is still there, revapi starts a **live view** at `http://127.0.0.1:8790/?k=…` and opens it in your phone's browser (`termux-open-url`).
+   - It mirrors revapi's headless browser and zooms onto the check. Your taps, scrolls and typing go straight into that browser.
+   - The link only works on this phone. It is protected by a one-time key.
+   - The session shows `▐ your turn ▌` with the link, and the status line says `waiting for you in the live view`.
+4. **Carry on.** Once the check is gone, the agent continues where it was.
+5. **Save the session.** The cookies and the browser's exact user agent are saved to `~/.revapi/sessions/<host>.json`. Generated clients load that file, send the same user agent, and when the pass expires they stop with `session expired: run revapi refresh <url>`.
+
+<img src="docs/liveview.png" width="280" alt="the live view on a phone">
+
+The saved browser profile (`~/.revapi/profile`, `keep_session=true`) keeps logins and passes between runs, so you usually pass a site once per session lifetime rather than once per run.
+
+```bash
+revapi refresh https://site.com          # open it, pass any check in the live view, save the session
+revapi cookies import site.com --ua "<your browser's user agent>"   # paste cookies from your own browser, then ctrl+d
+revapi cookies list                       # saved sessions (marks the ones with cf_clearance)
+revapi cookies show site.com | clear site.com
+revapi config set handoff off             # never open the live view: just report the check and stop
+```
+
+Limits:
+- Cloudflare ties the pass cookie (`cf_clearance`) to the user agent and to your IP. A session only works from the same phone and network.
+- Some sites also reject non-browser HTTP clients even with a valid pass. Then the client can't reuse the session, and the agent will tell you.
+- If revapi's own browser doesn't get a check it can pass, the live view can't change that. Use `revapi cookies import` with cookies from your own browser.
+
 ---
 
 ## What the agent can do (tools)
@@ -266,6 +296,8 @@ While the agent works, a live status line shows a split-flap verb (*reading*, *w
   runs/messages/<run_id>.jsonl      full agent transcript (used by /resume)
   runs/collected/<run_id>/          collector output
   runs/screenshots/<run_id>/
+  profile/                          saved Chromium profile (keep_session)
+  sessions/<host>.json              cookies + user agent after a passed check (read by generated clients)
 ./scripts/<prompt_slug>/            live mirror of the generated files (real_time_sync)
 ```
 
@@ -285,7 +317,12 @@ While the agent works, a live status line shows a split-flap verb (*reading*, *w
 | `output_dir` | `~/.revapi/runs` | Where runs are stored |
 | `real_time_sync` | `true` | Mirror generated files into `./scripts/` |
 | `headless` | `true` | Run the agent's browser headless |
-| `user_data_dir` | – | Persistent Chromium profile, which keeps you logged in between runs |
+| `keep_session` | `true` | Reuse the saved Chromium profile (`~/.revapi/profile`), so logins and passed checks survive between runs. A second run at the same time gets a fresh profile |
+| `user_data_dir` | – | Use this Chromium profile directory instead |
+| `handoff` | `auto` | Cloudflare/CAPTCHA checks: `live` opens the live view, `off` just reports the check, `auto` is live when a terminal is attached |
+| `handoff_timeout` | `600` | Seconds to wait for you in the live view |
+| `handoff_port` / `handoff_host` | `8790` / `127.0.0.1` | Live view address. `0.0.0.0` lets another device on your network open it |
+| `handoff_open` | `true` | Open the live view link in the phone's browser automatically |
 | `proxy` | – | e.g. `http://127.0.0.1:8080` |
 | `max_turns` | `120` | Agent step limit |
 | `shell_timeout` | `180` | Seconds allowed per shell command |

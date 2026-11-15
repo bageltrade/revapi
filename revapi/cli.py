@@ -307,6 +307,116 @@ def cmd_models(args: argparse.Namespace, cfg: store.Config) -> int:
     return 0
 
 
+def _handoff_say(message: str, data: dict) -> None:
+    stage = data.get("stage")
+    if stage == "grace":
+        print(dim(f"◇ {message}"), file=sys.stderr)
+    elif stage == "waiting":
+        t = int(data.get("timeout", 600))
+        mins = f"{t // 60}m" if t >= 60 else f"{t}s"
+        print(f"\n{bold('your turn')} · {data.get('label')} on {data.get('url')}", file=sys.stderr)
+        print(f"  open {cyan(data.get('live_url', ''))}", file=sys.stderr)
+        print(dim(f"  it mirrors revapi's browser · tap the check yourself · carries on once it clears · waits {mins} · ctrl+c stops\n"), file=sys.stderr)
+
+
+def cmd_refresh(args: argparse.Namespace, cfg: store.Config) -> int:
+    """Open the site in revapi's browser (saved profile); hand any human check to you; save the session."""
+    from .browser import Browser
+    from .cdp import CDPError
+    from .handoff import hand_off, host_of, save_session
+    from .tools import shared_profile
+
+    opts = modes._handoff_opts(cfg)
+    prof = cfg.get("user_data_dir") or shared_profile()
+    try:
+        b = Browser(headless=True if not args.headed else False, user_data_dir=prof, proxy=cfg.get("proxy"))
+    except CDPError as e:
+        print(red(str(e)), file=sys.stderr)
+        return 1
+    try:
+        print(dim(b.navigate(args.url)), file=sys.stderr)
+        res = hand_off(
+            b, _handoff_say, timeout=args.timeout or opts["handoff_timeout"], port=opts["handoff_port"], host=opts["handoff_host"], open_url=opts["handoff_open"] and not args.no_open, live=True
+        )
+        if res is None:
+            path = str(save_session(b, args.url, source="no check showing"))
+            res = {"passed": True, "how": "no check showing", "session": path, "url": args.url, "label": "", "seconds": 0}
+    except KeyboardInterrupt:
+        print(yellow("stopped"), file=sys.stderr)
+        return 130
+    finally:
+        b.close()
+    if args.json:
+        _out({k: res.get(k) for k in ("passed", "how", "session", "url", "label", "seconds")})
+    elif res["passed"]:
+        print(f"{green('✓')} {host_of(args.url)} · {res['how']} · session saved to {res['session']}")
+    else:
+        print(f"{red('✗')} {host_of(args.url)} · {res['how']}")
+    return 0 if res["passed"] else 1
+
+
+def cmd_cookies(args: argparse.Namespace, cfg: store.Config) -> int:
+    from .handoff import host_of, load_session, parse_cookies, session_path, sessions_dir, write_session
+
+    if args.action == "list":
+        rows = []
+        for f in sorted(sessions_dir().glob("*.json")):
+            try:
+                d = json.loads(f.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            names = {c.get("name") for c in d.get("cookies", [])}
+            rows.append({"host": d.get("host", f.stem), "cookies": len(names), "cf_clearance": "cf_clearance" in names, "saved_at": d.get("saved_at"), "source": d.get("source"), "path": str(f)})
+        if args.json:
+            _out({"sessions": rows})
+        elif not rows:
+            print(dim("no saved sessions · revapi refresh <url> or revapi cookies import <host>"))
+        for r in rows if not args.json else []:
+            cf = green(" cf_clearance") if r["cf_clearance"] else ""
+            print(f"{bold(r['host']):<40} {r['cookies']:>3} cookies{cf}  {dim(str(r['saved_at']) + ' · ' + str(r['source']))}")
+        return 0
+    if not args.host:
+        print(red(f"revapi cookies {args.action} needs a host"), file=sys.stderr)
+        return 2
+    host = host_of(args.host)
+    if args.action == "show":
+        d = load_session(host)
+        if not d:
+            print(red(f"no saved session for {host}"), file=sys.stderr)
+            return 1
+        print(json.dumps(d, indent=1, ensure_ascii=False))
+        return 0
+    if args.action == "clear":
+        p = session_path(host)
+        if p.exists():
+            p.unlink()
+            print(f"cleared the saved session for {host}")
+        else:
+            print(dim(f"no saved session for {host}"))
+        return 0
+    # import
+    if args.file:
+        text = Path(args.file).expanduser().read_text(encoding="utf-8")
+    else:
+        if sys.stdin.isatty():
+            print(dim("Paste the cookies (a Cookie header, a JSON export, or cookies.txt), then press ctrl+d:"), file=sys.stderr)
+        text = sys.stdin.read()
+    try:
+        cookies = parse_cookies(text, host)
+    except (ValueError, TypeError) as e:
+        print(red(f"could not read those cookies: {e}"), file=sys.stderr)
+        return 1
+    if not cookies:
+        print(red("no cookies found in that input"), file=sys.stderr)
+        return 1
+    ua = args.ua or ""
+    if not ua and "cf_clearance" in {c["name"] for c in cookies}:
+        print(yellow("note: cf_clearance only works with the exact user agent of the browser that passed the check · add --ua '<that browser's user agent>'"), file=sys.stderr)
+    path = write_session(host, cookies, ua, "imported")
+    print(f"{green('✓')} {len(cookies)} cookies for {host} saved to {path}")
+    return 0
+
+
 def cmd_har(args: argparse.Namespace, cfg: store.Config) -> int:
     p = Path(args.target)
     if not p.exists():
@@ -716,6 +826,20 @@ def build_parser() -> argparse.ArgumentParser:
     mo.add_argument("--all", action="store_true", help="include embedding/guard/etc. models")
     mo.add_argument("--json", action="store_true")
 
+    rf = sub.add_parser("refresh", help="open a site, pass any Cloudflare/CAPTCHA check yourself in the live view, save the session")
+    rf.add_argument("url")
+    rf.add_argument("--timeout", type=int, help="seconds to wait for you (default: handoff_timeout)")
+    rf.add_argument("--no-open", action="store_true", help="only print the live view link")
+    rf.add_argument("--headed", action="store_true", help="use a visible Chromium window (needs a display)")
+    rf.add_argument("--json", action="store_true")
+
+    ck = sub.add_parser("cookies", help="saved site sessions: list, show, clear, or import cookies from your own browser")
+    ck.add_argument("action", choices=["list", "show", "clear", "import"])
+    ck.add_argument("host", nargs="?")
+    ck.add_argument("-f", "--file", help="read cookies from a file instead of stdin")
+    ck.add_argument("--ua", help="user agent of the browser the cookies came from")
+    ck.add_argument("--json", action="store_true")
+
     h = sub.add_parser("har", help="inspect a HAR (run id or file)")
     h.add_argument("target")
     h.add_argument("--entry", type=int)
@@ -755,6 +879,8 @@ def main(argv: list[str] | None = None) -> int:
         "doctor": cmd_doctor,
         "har": cmd_har,
         "models": cmd_models,
+        "refresh": cmd_refresh,
+        "cookies": cmd_cookies,
     }
     if not args.cmd:
         if not sys.stdin.isatty():

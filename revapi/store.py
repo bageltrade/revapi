@@ -64,7 +64,13 @@ DEFAULTS: dict[str, Any] = {
     "max_turns": 120,
     "shell_timeout": 180,
     "proxy": None,
-    "user_data_dir": None,  # persistent Chromium profile (keeps logins between runs)
+    "user_data_dir": None,  # custom Chromium profile directory (overrides keep_session)
+    "keep_session": True,  # reuse ~/.revapi/profile so logins and passed checks survive between runs
+    "handoff": "auto",  # human checks (Cloudflare/CAPTCHA): live (open the live view) | off (just report) | auto (live when a terminal is attached)
+    "handoff_timeout": 600,  # seconds to wait for you in the live view
+    "handoff_port": 8790,  # live view port (next free one is used if taken)
+    "handoff_host": "127.0.0.1",  # 0.0.0.0 lets another device on your network open the live view
+    "handoff_open": True,  # open the live view in the phone's browser automatically (termux-open-url)
     "stream": True,  # stream replies token by token
     "retries": 40,  # attempts per model request before giving up (network drops, 429, 5xx, overloads…)
     "context_window": None,  # None -> known size for the model (128k if unknown); set to override
@@ -120,6 +126,10 @@ class Config:
             if not 0.3 <= value <= 0.95:
                 raise ValueError("compact_at must be between 0.3 and 0.95")
         if key in ("retries", "context_window", "max_tokens") and value is not None and (not isinstance(value, int) or value < 1):
+            raise ValueError(f"{key} must be a positive integer")
+        if key == "handoff" and value not in ("live", "off", "auto"):
+            raise ValueError("handoff must be live, off or auto")
+        if key in ("handoff_timeout", "handoff_port") and (not isinstance(value, int) or value < 1):
             raise ValueError(f"{key} must be a positive integer")
         if key == "effort" and value not in (None, *EFFORTS):
             raise ValueError("effort must be " + ", ".join(EFFORTS) + " or none")

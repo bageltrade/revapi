@@ -34,3 +34,5 @@ Plan your approach in a scratchpad before generating:
 - The paths to the generated files
 
 Do not include the full {output_type} in your response - just confirm the files were saved and summarize the key findings.
+
+{include:_human_checks}

@@ -55,6 +55,8 @@ NOISE_HOSTS = (
     "mixpanel",
     "amplitude",
     "fullstory",
+    "challenges.cloudflare.com",
+    "hcaptcha.com",
 )
 MAX_BODY = int(os.environ.get("REVAPI_MAX_BODY_BYTES", str(3 * 1024 * 1024)))
 
@@ -85,6 +87,8 @@ def is_api_like(url: str, mime: str = "", rtype: str = "") -> bool:
     if any(h in u.netloc for h in NOISE_HOSTS):
         return False
     path = u.path.lower()
+    if path.startswith("/cdn-cgi/"):  # Cloudflare's own check/insights endpoints, not the site's API
+        return False
     if rtype in ("Image", "Font", "Stylesheet", "Media", "Manifest", "Script"):
         return False
     if path.endswith(STATIC_EXT):

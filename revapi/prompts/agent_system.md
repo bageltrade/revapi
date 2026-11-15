@@ -20,6 +20,8 @@ Your integration surface is the **revapi browser tools** (browser_navigate, brow
 - Use the shell tool to run and test the generated code; fix it until it works (up to 5 attempts)
 - Screenshots are saved to disk; prefer snapshots to understand page structure
 
+{include:_human_checks}
+
 ## Output files
 
 {output_files}

@@ -17,9 +17,10 @@ from . import __version__, store
 from . import har as harlib
 from .agent import Agent
 from .browser import Browser, find_chromium, is_api_like
+from .handoff import hand_off, result_note
 from .llm import LLM, LLMError  # noqa: F401  (LLM re-exported for cli)
 from .prompts import load
-from .tools import Context, browser_tools, collector_tools, control_tools, file_tools, har_tools, web_tools
+from .tools import Context, browser_tools, shared_profile, collector_tools, control_tools, file_tools, har_tools, web_tools
 from .ui import Reporter, bold, cyan, dim, green, red, suspended, yellow
 
 SCHEMA_VERSION = 1
@@ -209,12 +210,14 @@ def run_agent(
         shell_timeout=cfg.get("shell_timeout", 180),
         proxy=cfg.get("proxy"),
         user_data_dir=cfg.get("user_data_dir"),
+        **_handoff_opts(cfg),
         ask=terminal_ask,
     )
     system = load("agent_system", codegen_instructions=cg.instructions(), output_files=cg.output_files(), ask_user_note=ask_note(interactive))
     user = load("agent_user", prompt=prompt, start_url_block=f"\n<start_url>\n{url}\n</start_url>\n" if url else "", scripts_dir=scripts, har_path=har)
     tools = browser_tools(ctx) + har_tools(ctx) + file_tools(ctx) + web_tools(ctx) + control_tools(ctx)
     agent = Agent(llm, tools, ctx, system, store.messages_path(run_id, output_dir), rep, cfg.get("max_turns", 120), compact_at=float(os.environ.get("REVAPI_COMPACT_AT") or 0) or cfg.get("compact_at"))
+    _wire_notify(ctx, agent)
     if keep is not None:
         keep.update(agent=agent, ctx=ctx, run_id=run_id, mode="agent", cg=cg, output_dir=output_dir)
     syncer = _start_sync(cfg, scripts, prompt, rep)
@@ -438,13 +441,46 @@ MANUAL_HELP = """commands:
   done                stop capturing (save HAR)"""
 
 
+def _handoff_opts(cfg: store.Config) -> dict:
+    """Context settings for the saved browser profile and the human check hand-off."""
+    return {
+        "keep_session": bool(cfg.get("keep_session", True)),
+        "handoff": str(cfg.get("handoff", "auto")),
+        "handoff_timeout": float(cfg.get("handoff_timeout", 600)),
+        "handoff_port": int(cfg.get("handoff_port", 8790)),
+        "handoff_host": str(cfg.get("handoff_host", "127.0.0.1")),
+        "handoff_open": bool(cfg.get("handoff_open", True)),
+    }
+
+
+def _wire_notify(ctx: Context, agent: Agent) -> None:
+    ctx.notify = lambda message, data: agent.on_event("handoff", {"message": message, **data})
+
+
 def capture_manual(cfg: store.Config, rep: Reporter, url: str | None, run_id: str, output_dir: str | None, headed: bool) -> Path:
     """User drives the browser; everything is recorded. Headed if a display exists, else a command shell."""
     har = store.har_path(run_id, output_dir)
-    b = Browser(headless=not headed, user_data_dir=cfg.get("user_data_dir"), proxy=cfg.get("proxy"))
+    opts = _handoff_opts(cfg)
+    prof = cfg.get("user_data_dir") or (shared_profile() if opts["keep_session"] else None)
+    b = Browser(headless=not headed, user_data_dir=prof, proxy=cfg.get("proxy"))
+
+    def check() -> str:
+        if headed:
+            return ""
+        res = hand_off(
+            b,
+            lambda message, data: rep("handoff", {"message": message, **data}),
+            timeout=opts["handoff_timeout"],
+            port=opts["handoff_port"],
+            host=opts["handoff_host"],
+            open_url=opts["handoff_open"],
+            live=opts["handoff"] != "off",
+        )
+        return ("\n" + result_note(res)) if res else ""
+
     try:
         if url:
-            rep.log(b.navigate(url))
+            rep.log(b.navigate(url) + check())
         if headed:
             rep.log(f"{green('●')} Browse in the Chromium window. Everything is recorded. Press {bold('Enter')} here when done.")
             try:
@@ -468,7 +504,7 @@ def capture_manual(cfg: store.Config, rep: Reporter, url: str | None, run_id: st
                 elif cmd == "help":
                     out = MANUAL_HELP
                 elif cmd == "go":
-                    out = b.navigate(arg) + "\n" + b.snapshot(4000)
+                    out = b.navigate(arg) + check() + "\n" + b.snapshot(4000)
                 elif cmd == "snap":
                     out = b.snapshot(int(arg) if arg.isdigit() else 12000)
                 elif cmd == "click":
@@ -573,7 +609,17 @@ def run_collector(prompt: str, cfg: store.Config, rep: Reporter, model: str | No
     rep.emit("run_started", run_id=run_id, mode="collector", model=llm.describe(), output_dir=str(out))
     _setup_rep(rep, cfg, "collector")
     rep.run_header("collector", run_id, llm.describe())
-    ctx = Context(workdir=out, har_path=store.har_path(run_id, output_dir), items_path=items, interactive=interactive, ask=terminal_ask, headless=True)
+    ctx = Context(
+        workdir=out,
+        har_path=store.har_path(run_id, output_dir),
+        items_path=items,
+        interactive=interactive,
+        ask=terminal_ask,
+        headless=True,
+        proxy=cfg.get("proxy"),
+        user_data_dir=cfg.get("user_data_dir"),
+        **_handoff_opts(cfg),
+    )
     tools = web_tools(ctx) + collector_tools(ctx) + browser_tools(ctx) + [t for t in file_tools(ctx) if t.name in ("read_file", "shell")] + control_tools(ctx)
     agent = Agent(
         llm,
@@ -585,6 +631,7 @@ def run_collector(prompt: str, cfg: store.Config, rep: Reporter, model: str | No
         cfg.get("max_turns", 120),
         compact_at=float(os.environ.get("REVAPI_COMPACT_AT") or 0) or cfg.get("compact_at"),
     )
+    _wire_notify(ctx, agent)
     if keep is not None:
         keep.update(agent=agent, ctx=ctx, run_id=run_id, mode="collector", output_dir=output_dir)
     try:
@@ -771,6 +818,7 @@ def resume(run_id: str, cfg: store.Config, rep: Reporter, model: str | None = No
         items_path=scripts / "items.jsonl" if mode == "collector" else None,
         proxy=cfg.get("proxy"),
         user_data_dir=cfg.get("user_data_dir"),
+        **_handoff_opts(cfg),
     )
     agent = Agent(
         make_llm(cfg, model, collector=mode == "collector"),
@@ -783,6 +831,7 @@ def resume(run_id: str, cfg: store.Config, rep: Reporter, model: str | None = No
         messages=msgs,
         compact_at=float(os.environ.get("REVAPI_COMPACT_AT") or 0) or cfg.get("compact_at"),
     )
+    _wire_notify(ctx, agent)
     cg = Codegen(rec.get("output_language") or cfg.get("output_language"), rec.get("output_mode") or cfg.get("output_mode"), scripts)
     return {"agent": agent, "ctx": ctx, "run_id": run_id, "mode": mode, "cg": cg, "output_dir": output_dir}
 

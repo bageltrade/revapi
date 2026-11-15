@@ -16,3 +16,5 @@ Each item is a JSON object, for example:
 ```
 
 When complete, call `finish` with a brief summary of what was collected.
+
+{include:_human_checks}

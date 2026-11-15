@@ -1045,5 +1045,183 @@ class BrowserAndPipelines(unittest.TestCase):
         self.assertEqual(lines[-1]["status"], "ok")
 
 
+class HumanCheckUnit(unittest.TestCase):
+    """Cloudflare/CAPTCHA hand-off: cookie import, session files, settings, UI, prompts (no browser)."""
+
+    def test_parse_cookie_formats(self) -> None:
+        from revapi.handoff import parse_cookies
+
+        hdr = parse_cookies("Cookie: cf_clearance=abc.def-1; sid=42", "https://www.example.com/x")
+        self.assertEqual([(c["name"], c["value"], c["domain"]) for c in hdr], [("cf_clearance", "abc.def-1", "www.example.com"), ("sid", "42", "www.example.com")])
+        js = parse_cookies(json.dumps([{"name": "cf_clearance", "value": "v", "domain": ".example.com", "expirationDate": 1999999999.5, "httpOnly": True}]), "example.com")
+        self.assertEqual((js[0]["domain"], js[0]["expires"], js[0]["httpOnly"]), (".example.com", 1999999999.5, True))
+        txt = parse_cookies("# Netscape HTTP Cookie File\n#HttpOnly_.example.com\tTRUE\t/\tTRUE\t1999999999\tcf_clearance\tzz\n.example.com\tTRUE\t/\tFALSE\t0\tlang\ten\n", "example.com")
+        self.assertEqual([(c["name"], c["httpOnly"], c["secure"]) for c in txt], [("cf_clearance", True, True), ("lang", False, False)])
+
+    def test_cookies_cli_import_list_show_clear(self) -> None:
+        import contextlib
+        import io
+
+        from revapi import cli
+        from revapi.handoff import load_session
+
+        src = Path(tempfile.mkdtemp()) / "c.txt"
+        src.write_text("cf_clearance=ok123; theme=dark")
+        err, out = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+            self.assertEqual(cli.main(["cookies", "import", "https://shop.example.org/a", "-f", str(src), "--ua", "Mozilla/5.0 Phone"]), 0)
+            self.assertEqual(cli.main(["cookies", "list", "--json"]), 0)
+        d = load_session("shop.example.org")
+        self.assertEqual((d["cookie_header"], d["user_agent"], d["source"]), ("cf_clearance=ok123; theme=dark", "Mozilla/5.0 Phone", "imported"))
+        listed = json.loads(out.getvalue().splitlines()[-1])
+        self.assertTrue(any(r["host"] == "shop.example.org" and r["cf_clearance"] for r in listed["sessions"]))
+        if os.name == "posix":
+            self.assertEqual(os.stat(Path(listed["sessions"][0]["path"]).parent / "shop.example.org.json").st_mode & 0o777, 0o600)
+        # cf_clearance without --ua warns: it only works with the browser's exact user agent
+        err2 = io.StringIO()
+        with contextlib.redirect_stderr(err2), contextlib.redirect_stdout(io.StringIO()):
+            cli.main(["cookies", "import", "b.example.org", "-f", str(src)])
+        self.assertIn("exact user agent", err2.getvalue())
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.main(["cookies", "clear", "shop.example.org"]), 0)
+        self.assertIsNone(load_session("shop.example.org"))
+
+    def test_challenge_traffic_is_not_api(self) -> None:
+        self.assertFalse(is_api_like("https://site.com/cdn-cgi/challenge-platform/h/b/flow/ov1/x", "application/json", "XHR"))
+        self.assertFalse(is_api_like("https://challenges.cloudflare.com/turnstile/v0/api.js", "", "Fetch"))
+        self.assertTrue(is_api_like("https://site.com/api/items", "application/json", "XHR"))
+
+    def test_settings_and_prompts(self) -> None:
+        cfg = store.Config(Path(tempfile.mkdtemp()) / "c.json")
+        self.assertEqual((cfg.get("handoff"), cfg.get("keep_session"), cfg.get("handoff_timeout")), ("auto", True, 600))
+        cfg.set("handoff", "live")
+        with self.assertRaises(ValueError):
+            cfg.set("handoff", "solve")
+        with self.assertRaises(ValueError):
+            cfg.set("handoff_timeout", "0")
+        opts = modes._handoff_opts(cfg)
+        self.assertEqual((opts["handoff"], opts["handoff_port"], opts["handoff_open"]), ("live", 8790, True))
+        for name in ("agent_system", "engineer_system", "collector_system"):
+            text = load(name, codegen_instructions="", output_files="", ask_user_note="")
+            self.assertIn("revapi never solves or works around these checks", text, name)
+            self.assertIn("revapi refresh", text, name)
+
+    def test_reporter_shows_the_hand_off(self) -> None:
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            rep = Reporter()
+            base = {"label": "Cloudflare Turnstile check", "url": "https://site.com/login", "kind": "turnstile"}
+            rep("handoff", {"stage": "grace", "message": "Cloudflare Turnstile check on site.com · giving it a few seconds", **base})
+            rep("handoff", {"stage": "waiting", "message": "", "live_url": "http://127.0.0.1:8790/?k=abc", "timeout": 600, **base})
+            self.assertEqual(rep.verb, "waiting for you in the live view")
+            rep("handoff", {"stage": "end", "message": "", "passed": True, "how": "you passed it in the live view", "session": "/x/site.com.json", **base})
+        out = termmod.strip_ansi(buf.getvalue())
+        for want in ("giving it a few seconds", "your turn", "http://127.0.0.1:8790/?k=abc", "waits 10m", "✓ Cloudflare Turnstile check", "session saved /x/site.com.json"):
+            self.assertIn(want, out)
+        self.assertNotEqual(rep.verb, "waiting for you in the live view")
+
+
+@unittest.skipUnless(HAS_CHROMIUM, "no chromium")
+class HumanCheckBrowser(unittest.TestCase):
+    """A stand-in check page on the local fixture: the person passes it through the live view."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.srv = serve()
+        cls.base = f"http://127.0.0.1:{cls.srv.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.srv.shutdown()
+
+    def _ctx(self, **kw: Any) -> tuple[Context, dict]:
+        from revapi.tools import browser_tools
+
+        d = Path(tempfile.mkdtemp())
+        ctx = Context(workdir=d, har_path=d / "t.har", handoff_open=False, handoff_timeout=60, handoff_port=18790, **kw)
+        return ctx, {t.name: t for t in browser_tools(ctx)}
+
+    def test_live_view_pass_then_saved_profile_and_self_clearing(self) -> None:
+        import threading
+        import urllib.error
+        import urllib.request
+
+        from revapi import handoff
+
+        profile = tempfile.mkdtemp()
+        seen: list[tuple[str, dict]] = []
+
+        def person(data: dict) -> None:
+            url = data["live_url"]
+            root, k = url.split("/?")[0], url.split("k=")[1]
+            page = urllib.request.urlopen(url, timeout=10).read().decode()
+            assert "Cloudflare check" in page
+            assert urllib.request.urlopen(f"{root}/frame.jpg?k={k}", timeout=10).read()[:2] == b"\xff\xd8"
+            try:
+                urllib.request.urlopen(f"{root}/state?k=wrong", timeout=5)
+                seen.append(("bad-key-allowed", {}))
+            except urllib.error.HTTPError as e:
+                seen.append(("bad-key", {"code": e.code}))
+            st = json.load(urllib.request.urlopen(f"{root}/state?k={k}", timeout=5))
+            body = json.dumps({"fx": 190 / st["w"], "fy": 100 / st["h"]}).encode()  # middle of the box
+            urllib.request.urlopen(urllib.request.Request(f"{root}/tap?k={k}", data=body, headers={"content-type": "application/json"}), timeout=10)
+
+        def notify(message: str, data: dict) -> None:
+            seen.append((data.get("stage"), data))
+            if data.get("stage") == "waiting":
+                threading.Thread(target=person, args=(data,), daemon=True).start()
+
+        with mock.patch.object(handoff, "GRACE_S", 2.0):
+            ctx, tools = self._ctx(handoff="live", notify=notify, user_data_dir=profile)
+            try:
+                out = tools["browser_navigate"].handler(url=self.base + "/gate")
+                self.assertIn("[human check] Cloudflare check on 127.0.0.1: you passed it in the live view", out)
+                self.assertIn("Members area", out)  # the snapshot is taken after the pass
+                self.assertIn(("bad-key", {"code": 403}), seen)
+                self.assertEqual([s for s, _ in seen if s in ("grace", "waiting", "end")], ["grace", "waiting", "end"])
+                sess = handoff.load_session("127.0.0.1")
+                self.assertIn("cf_clearance=ok", sess["cookie_header"])
+                self.assertIn("Chrome", sess["user_agent"])
+                # a check that clears by itself never opens the live view
+                out2 = tools["browser_navigate"].handler(url=self.base + "/autogate")
+                self.assertIn("cleared on its own", out2)
+            finally:
+                ctx.close_browser()
+            # the saved profile keeps the pass for the next run
+            ctx2, tools2 = self._ctx(handoff="off", user_data_dir=profile)
+            try:
+                out3 = tools2["browser_navigate"].handler(url=self.base + "/gate")
+                self.assertIn("Members area", out3)
+                self.assertNotIn("[human check]", out3)
+            finally:
+                ctx2.close_browser()
+            # a fresh profile with the live view off: reported, never worked around
+            ctx3, tools3 = self._ctx(handoff="off")
+            try:
+                out4 = tools3["browser_navigate"].handler(url=self.base + "/gate")
+                self.assertIn("is still showing: live view is off", out4)
+                self.assertIn("revapi refresh", out4)
+            finally:
+                ctx3.close_browser()
+
+    def test_shared_profile_falls_back_when_in_use(self) -> None:
+        from revapi.tools import shared_profile
+
+        p = Path(shared_profile())
+        lock = p / "SingletonLock"
+        lock.unlink(missing_ok=True)
+        os.symlink(f"somehost-{os.getpid()}", lock)
+        try:
+            notes: list[str] = []
+            self.assertIsNone(shared_profile(notes))
+            self.assertIn("in use", notes[0])
+        finally:
+            lock.unlink()
+        self.assertEqual(shared_profile(), str(p))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
