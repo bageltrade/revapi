@@ -640,7 +640,7 @@ class Reporter:
         if main_w + stub_w + 4 > T.cols():  # narrow phone screen: no box
             self.out("", *(m for m, _ in main), f"  {sty(' · '.join(x[1] for x in stub), DIM)}", f"  {sty(str(p), DIM)}", "")
             return
-        legend = " client "
+        legend = " mcp server " if p.name == "server.py" and (p.parent / "revapi_mcp.py").exists() else " docs " if p.suffix == ".json" else " client "
         out = ["", " " + sty("╭─", HAIRLINE) + sty(legend, DIM) + sty("─" * (main_w - len(legend) - 1) + "┬" + "─" * stub_w + "╮", HAIRLINE)]
         for (m, mp), (s, sp) in zip(main, stub, strict=True):
             out.append(" " + sty("│", HAIRLINE) + "  " + m + " " * (main_w - 2 - len(mp)) + sty("┊", HAIRLINE) + "  " + s + " " * (stub_w - 2 - len(sp)) + sty("│", HAIRLINE))

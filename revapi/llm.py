@@ -146,7 +146,8 @@ CONTEXT_HINTS = (
     "model_context_window_exceeded",
     "string too long",
 )
-OVERLOAD_HINTS = ("overloaded", "rate limit", "rate_limit", "capacity", "temporarily", "try again", "timeout", "unavailable", "internal error", "server_error")
+GATEWAY_CRASH_HINTS = ("upstream_error", "usage_missing", "bad gateway")
+OVERLOAD_HINTS = ("overloaded", "rate limit", "rate_limit", "capacity", "temporarily", "try again", "timeout", "unavailable", "internal error", "server_error", *GATEWAY_CRASH_HINTS)
 NETWORK_ERRORS: tuple[type[BaseException], ...] = (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError, http.client.HTTPException, ssl.SSLError, OSError)
 
 RetryHook = Callable[[int, int, float, str], None]  # (retry number, max retries, wait seconds, reason)
@@ -262,6 +263,9 @@ def _send(
                 if on_reset:
                     on_reset()
                 again(str(e), e.kind)
+                fresh = rebuild() if rebuild else None
+                if fresh is not None:
+                    data = json.dumps(fresh).encode()
                 continue
             raise
         except json.JSONDecodeError as e:
@@ -549,6 +553,7 @@ class LLM:
         self.max_tokens = max_tokens
         self.chunk_writes = provider == "nvidia" or bool(os.environ.get("REVAPI_CHUNK_WRITES"))
         self.silent_cuts = 0
+        self.gateway_crashes = 0
         self.stream = (os.environ.get("REVAPI_NO_STREAM") is None) if stream is None else stream
         self.retries = max(1, int(retries or os.environ.get("REVAPI_RETRIES") or DEFAULT_RETRIES))
         self.context_window = int(context or os.environ.get("REVAPI_CONTEXT_WINDOW") or context_window(self.model))
@@ -625,6 +630,8 @@ class LLM:
                 m = {**m, "name": clean_name(m["name"])}
             if m.get("tool_calls"):
                 m = {**m, "tool_calls": [{**tc, "function": {**tc["function"], "name": clean_name(tc["function"]["name"])}} for tc in m["tool_calls"]]}
+            elif m.get("role") == "assistant" and not m.get("content"):
+                continue  # an empty turn (no text, no calls): vLLM-based gateways reject it and every retry would fail
             msgs.append(m)
         if self.chunk_writes and tools and any(t.get("name") == "append_file" for t in tools):
             msgs = with_chunk_hint(msgs)
@@ -686,6 +693,8 @@ class LLM:
                         err.kind = "context_length"
                         err.window = window_from_error(err_text)  # type: ignore[attr-defined]
                         err.retryable = False  # type: ignore[attr-defined]
+                    elif any(h in err_text.lower() for h in GATEWAY_CRASH_HINTS):
+                        self.gateway_crashes += 1  # the same context tends to crash again: the retry is nudged
                     raise err
                 if ev.get("usage"):
                     usage = ev["usage"]
@@ -703,6 +712,10 @@ class LLM:
                         idx = tc.get("index")
                         if idx is None:
                             idx = next((i for i, c in calls.items() if tc.get("id") and c["id"] == tc.get("id")), len(calls))
+                        if idx not in calls and calls and not tc.get("id") and not (tc.get("function") or {}).get("name"):
+                            # some gateways (pollinations, a few proxies) re-index the tail of a call's arguments;
+                            # a genuinely new call always brings its name or id, so this continues the last one
+                            idx = max(calls)
                         slot = calls.setdefault(idx, {"id": "", "name": "", "args": ""})
                         if tc.get("id"):
                             slot["id"] = tc["id"]
@@ -739,9 +752,17 @@ class LLM:
             return reply
 
         cuts_seen = self.silent_cuts
+        crashes_seen = self.gateway_crashes
 
         def rebuild() -> dict | None:
-            nonlocal cuts_seen
+            nonlocal cuts_seen, crashes_seen
+            if self.gateway_crashes != crashes_seen and self.silent_cuts == cuts_seen:
+                n = self.gateway_crashes - crashes_seen
+                crashes_seen = self.gateway_crashes
+                fresh = self._openai_body(messages, tools, stream)
+                note = "[revapi] The provider failed on the previous attempt. Continue the task with your next step." + " " * n
+                fresh["messages"] = [*fresh["messages"], {"role": "user", "content": note}]
+                return fresh
             if self.silent_cuts == cuts_seen:
                 return None
             cuts_seen = self.silent_cuts

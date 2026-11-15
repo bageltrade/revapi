@@ -101,6 +101,7 @@ NVIDIA's gateway doesn't stream tool-call arguments. It holds back the whole cal
 | `manual` | You drive the browser and everything is recorded; then the agent engineers the HAR. You get a real window if a display exists. On Termux you get a command shell instead (`go`, `snap`, `click e3`, `type e5 hello ⏎`, `reqs`, `req 4`, …). |
 | `engineer` | Generate or refine a client from a past run's HAR, or from any `.har` file (`--har`). Follow-up instructions edit the existing client in place; `--fresh` rewrites it from scratch. |
 | `collector` | The agent searches and fetches the web (falling back to the browser for JS-heavy pages) and saves structured items as `items.jsonl`, `items.json`, `data.csv` and `README.md`. |
+| `mcp` | Build an MCP server for any website with the tools you ask for (`revapi mcp new`, `--mcp`, or `/mcp`). See [MCP servers](#mcp-servers-from-any-website). |
 | `run` | Run a generated client. Missing Python or Node dependencies are detected and installed with a prompt, or automatically with `--auto-install`. |
 
 ### Examples
@@ -225,6 +226,54 @@ While the agent works, a live status line shows a split-flap verb (*reading*, *w
 - **Context windows.** These are known for common models (Claude 200k, Kimi K2.6 256k, GPT-4.1 1M, Gemini 1M, …), or you can set `context_window`. If a provider says a request is too long, revapi learns the real limit from the error, compacts and continues.
 - **Compaction.** Older turns are summarized by the model into a structured working memory: the request, the API surface found so far, auth, files and the next step. If that fails, revapi falls back to shortening old outputs into recallable pointers. The latest exchange always stays verbatim. A compaction that would not shrink anything is skipped.
 - **Nothing lost.** `runs/messages/<run_id>.jsonl` keeps every message with a sequence number, plus a snapshot at each compaction. `/resume` restarts from the latest snapshot, and the agent's `recall` tool reads any original message back.
+
+### MCP servers from any website
+
+revapi can turn a website into an **MCP server**, so Claude Code, Codex, Gemini CLI, opencode, Hermes or any MCP client can call the site's functions as tools. You choose which tools you want, and revapi captures the site's traffic, finds the matching endpoints, and writes and tests `server.py` for you.
+
+```bash
+revapi mcp new "search products, get a product by id, add to cart" -u https://shop.example.com
+revapi mcp from 20261114-101500-ab12 "tools for listing and posting comments"   # reuse a past capture
+revapi agent --mcp "..." -u URL        # the same thing via any mode's --mcp flag
+```
+
+Inside the REPL, type `/mcp` to switch output to MCP servers (`/mcp` again switches back to clients).
+
+The generated server is **pure Python standard library**. It needs no `mcp` SDK, pydantic or compiled packages, so it runs anywhere Termux's `python` runs. It ships as two files: `server.py` (your tools) and `revapi_mcp.py` (a small MCP runtime). It supports stdio and Streamable HTTP, protocol versions 2024-11-05 to 2025-11-25, and has been checked against the official MCP SDK.
+
+Servers are installed to `~/.revapi/mcp/<name>/`. A new run never overwrites another server. Re-engineering the same run updates its server.
+
+| Command | What it does |
+|---|---|
+| `revapi mcp list` | Installed servers and their tools |
+| `revapi mcp test <name>` | Handshake and list tools. `--call search '{"query":"shoes"}'` calls one tool for real. |
+| `revapi mcp config <name> [client]` | Prints the config snippet for claude, codex, gemini, opencode, hermes, json or http |
+| `revapi mcp add <name> <client>` | Registers the server with that client: runs `claude mcp add`, or merges into `~/.codex/config.toml`, `~/.gemini/settings.json` or `~/.config/opencode/opencode.json` (a `.bak` is kept) |
+| `revapi mcp serve <name> [--http 8811]` | Runs it over stdio, or over HTTP at `http://127.0.0.1:8811/mcp` |
+| `revapi mcp install <dir> [--name n]` | Installs a server folder you wrote or edited yourself |
+| `revapi mcp remove <name>` | Deletes an installed server |
+
+Example Claude Code registration (printed by `revapi mcp config shop claude`):
+
+```bash
+claude mcp add shop -- python /data/data/com.termux/files/home/.revapi/mcp/shop/server.py
+```
+
+For sites that need a login, servers use the saved session from `revapi refresh <url>` (see the live view below). When cookies expire, a tool replies with "session expired, run `revapi refresh <site>`" instead of failing silently. Tools are marked read-only or not, so clients can ask you before a tool posts or buys anything.
+
+Edit `server.py` freely. Each tool is a plain Python function with type hints and a docstring:
+
+```python
+@mcp.tool(read_only=True)
+def search(query: str, limit: int = 20) -> dict:
+    """Search products.
+
+    Args:
+        query: words to look for
+        limit: max results, 1-100
+    """
+    return s.get("/api/search", params={"q": query, "limit": limit}).json()
+```
 
 ### Cloudflare and CAPTCHA checks (live view)
 
@@ -388,6 +437,7 @@ The test suite:
 - launches the real Chromium against a local fixture app;
 - runs the agent, engineer (including docs mode and external HAR input), collector, manual-shell and `--json-stream` pipelines end to end with a scripted model;
 - checks the OpenAI and Anthropic wire formats, SSE streaming (thinking, text and tool deltas, `<think>` tags, mid-stream errors and drops), the 40-retry logic, Retry-After, context-window detection, summary and fallback compaction with recall and resume, the reporter and Markdown renderer, config, history and the script runner.
+- checks generated MCP servers: schemas from type hints and docstrings, the JSON-RPC protocol, stdio and HTTP transports against the live fixture, saved sessions and expiry, install/config/add/remove, and a full agent run in MCP mode. The runtime has also been verified against the official `mcp` Python SDK.
 
 `tests/mock_provider.py` is a scripted OpenAI-compatible server that streams thinking and tool calls, fails on purpose (a 503, then a cut stream) and answers compaction requests. Use it to watch the full terminal experience without an API key.
 

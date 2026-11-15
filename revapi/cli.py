@@ -59,9 +59,12 @@ def _finish(res: dict, args: argparse.Namespace, rep: Reporter) -> int:
         else:
             for k in ("script_path", "local_path", "har_path"):
                 if res.get(k):
-                    label = {"script_path": "client", "local_path": "copy", "har_path": "capture"}[k]
+                    label = {"script_path": "server" if res.get("mcp") else "client", "local_path": "copy", "har_path": "capture"}[k]
                     print(f"   {T.sty('└', T.HAIRLINE)} {T.sty(f'{label:<7}', T.DIM)} {T.sty(T.link(str(res[k]), Path(str(res[k])).resolve().as_uri()), T.INK_SOFT)}", file=sys.stderr)
-            if res.get("run_id") and res.get("mode") != "collector":
+            if res.get("mcp"):
+                n = res["mcp"]["name"]
+                print(dim(f'\n   test it: revapi mcp test {n}  ·  add tools: revapi mcp from {res["run_id"]} "..."'), file=sys.stderr)
+            elif res.get("run_id") and res.get("mode") != "collector":
                 print(dim(f'\n   run it: revapi run {res["run_id"]}  ·  refine: revapi engineer {res["run_id"]} -p "..."'), file=sys.stderr)
     return 1 if res.get("error") else 0
 
@@ -417,6 +420,139 @@ def cmd_cookies(args: argparse.Namespace, cfg: store.Config) -> int:
     return 0
 
 
+def _use_mcp(cfg: store.Config) -> None:
+    """MCP output for this command only (the saved output_mode is left alone)."""
+    cfg.data["output_mode"] = "mcp"
+
+
+def cmd_mcp(args: argparse.Namespace, cfg: store.Config) -> int:
+    from . import mcpgen
+
+    act = args.mcp_cmd
+    if act in (None, "list"):
+        rows = mcpgen.installed()
+        if getattr(args, "json", False):
+            _out({"servers": rows, "root": str(mcpgen.root())})
+            return 0
+        if not rows:
+            print(dim('no MCP servers yet · make one: revapi mcp new "tools to search and read posts" -u https://site.com'))
+            return 0
+        for r in rows:
+            tools = r.get("tools") or []
+            print(f"{bold(r['name'])}  {dim(str(len(tools)) + ' tools')}  {dim(r.get('url') or '')}")
+            if tools:
+                print("   " + dim(", ".join(tools)))
+        print(dim(f"\n{mcpgen.root()} · revapi mcp config <name> · revapi mcp add <name> <client>"))
+        return 0
+    if act == "new":
+        prompt = " ".join(args.words or []) or args.prompt
+        if not prompt:
+            if not sys.stdin.isatty():
+                print(red('describe the tools: revapi mcp new "search products, product details, reviews" -u https://site.com'), file=sys.stderr)
+                return 2
+            prompt = input(bold("Which tools should the MCP server have? ") + "> ").strip()
+        _use_mcp(cfg)
+        ns = argparse.Namespace(
+            prompt=prompt,
+            url=args.url,
+            model=args.model,
+            output_dir=args.output_dir,
+            headed=args.headed,
+            headless=False,
+            dry_run=False,
+            json=args.json,
+            json_stream=False,
+            verbose=args.verbose,
+            no_interactive=args.no_interactive,
+        )
+        return cmd_agent(ns, cfg)
+    if act == "from":
+        _use_mcp(cfg)
+        ns = argparse.Namespace(
+            run_id=args.run_id,
+            har=args.har,
+            prompt=" ".join(args.words or []) or None,
+            fresh=False,
+            model=args.model,
+            output_dir=args.output_dir,
+            json=args.json,
+            json_stream=False,
+            verbose=args.verbose,
+            no_interactive=args.no_interactive,
+        )
+        return cmd_engineer(ns, cfg)
+    try:
+        server = mcpgen.resolve(args.target)
+    except FileNotFoundError as e:
+        print(red(str(e)), file=sys.stderr)
+        return 1
+    meta_path = server.parent / "revapi-mcp.json"
+    name = json.loads(meta_path.read_text(encoding="utf-8")).get("name") if meta_path.exists() else mcpgen.slug(server.parent.name)
+    if act == "install":
+        rec = store.History().get(args.target) or {}
+        meta = mcpgen.install(server.parent, args.name or mcpgen.name_for_run(rec.get("run_id", ""), rec.get("url"), rec.get("prompt")), rec.get("run_id", ""), rec.get("url"), rec.get("prompt") or "")
+        print(f"{green('✓')} installed {bold(meta['name'])} · {len(meta['tools'])} tools · {meta['path']}")
+        if meta.get("error"):
+            print(yellow(meta["error"][:500]))
+        return 0 if not meta.get("error") else 1
+    if act == "test":
+        try:
+            info = mcpgen.handshake(server)
+        except (RuntimeError, subprocess.TimeoutExpired) as e:
+            print(f"{red('✗')} {name}: {e}")
+            return 1
+        print(f"{green('✓')} {info['server'].get('name', name)} · MCP {info['protocol']} · {len(info['tools'])} tools")
+        for t in info["tools"]:
+            req = t.get("inputSchema", {}).get("required", [])
+            params = ", ".join(f"{k}{'' if k in req else '?'}" for k in t.get("inputSchema", {}).get("properties", {}))
+            print(f"  {bold(t['name'])}({params})  {dim((t.get('description') or '').splitlines()[0][:90] if t.get('description') else '')}")
+        if args.call:
+            r = subprocess.run([mcpgen.python_cmd(), str(server), "--call", args.call, args.arguments or "{}"], cwd=str(server.parent))
+            return r.returncode
+        return 0
+    if act == "config":
+        snippets = mcpgen.config(server, name)
+        if args.json:
+            _out(snippets)
+            return 0
+        pick = [args.client] if args.client else ["claude", "codex", "gemini", "opencode", "hermes", "http"]
+        titles = {
+            "claude": "Claude Code",
+            "codex": "Codex CLI",
+            "gemini": "Gemini CLI",
+            "opencode": "opencode",
+            "hermes": "Hermes",
+            "http": "Streamable HTTP (any client that takes a URL)",
+            "json": "mcpServers JSON",
+        }
+        for k in pick:
+            print(bold(titles.get(k, k)))
+            print(snippets[k] + "\n")
+        print(dim(f"or let revapi add it: revapi mcp add {name} claude|codex|gemini|opencode"))
+        return 0
+    if act == "add":
+        try:
+            print(f"{green('✓')} {mcpgen.add_to(args.client, server, name)}")
+        except (RuntimeError, OSError, subprocess.TimeoutExpired) as e:
+            print(red(str(e)), file=sys.stderr)
+            return 1
+        return 0
+    if act == "serve":
+        cmd = [mcpgen.python_cmd(), str(server)] + (["--http", str(args.http), "--host", args.host] if args.http else [])
+        try:
+            return subprocess.run(cmd, cwd=str(server.parent)).returncode
+        except KeyboardInterrupt:
+            return 0
+    if act == "remove":
+        if server.parent.parent != mcpgen.root():
+            print(red(f"{server} is not an installed server (only ~/.revapi/mcp/<name> can be removed)"), file=sys.stderr)
+            return 1
+        shutil.rmtree(server.parent)
+        print(f"removed {name} · also remove it from your MCP client's config")
+        return 0
+    return 2
+
+
 def cmd_har(args: argparse.Namespace, cfg: store.Config) -> int:
     p = Path(args.target)
     if not p.exists():
@@ -447,6 +583,7 @@ REPL_COMMANDS = {
     "/mode": "choose the mode (agent|manual|engineer|collector)",
     "/language": "output language (python, javascript, typescript, go, java, csharp, php, ruby, c, powershell)",
     "/docs": "toggle OpenAPI docs output instead of a client",
+    "/mcp": "toggle MCP server output instead of a client",
     "/settings": "all settings (/settings <key> <value> to change)",
     "/history": "past runs: their details, resume or re-engineer",
     "/resume": "a past run's conversation, to continue it (/resume <run_id>)",
@@ -482,7 +619,7 @@ Type a request to start (include a URL to set the start page). Follow-up message
 
 def _banner(cfg: store.Config, mode: str, desc: str) -> None:
     a = T.MODE_COLORS.get(mode, T.PINK)
-    lang = cfg.get("output_language") + (" (docs)" if cfg.get("output_mode") == "docs" else "")
+    lang = "MCP server" if cfg.get("output_mode") == "mcp" else cfg.get("output_language") + (" (docs)" if cfg.get("output_mode") == "docs" else "")
     effort = cfg.get("effort")
     print(file=sys.stderr)
     print(
@@ -599,6 +736,9 @@ def repl(cfg: store.Config) -> int:
                     print(red(str(e)))
             elif cmd == "/docs":
                 cfg.set("output_mode", "client" if cfg.get("output_mode") == "docs" else "docs")
+                print(f"output → {cfg.get('output_mode')}")
+            elif cmd == "/mcp":
+                cfg.set("output_mode", "client" if cfg.get("output_mode") == "mcp" else "mcp")
                 print(f"output → {cfg.get('output_mode')}")
             elif cmd == "/settings":
                 if arg:
@@ -725,7 +865,7 @@ def _show(res: dict, shown: bool = False) -> None:
             print(f"    {dim('nothing is lost — type a follow-up or /resume ' + str(res['run_id']) + ' to continue')}", file=sys.stderr)
     for k in ("script_path", "local_path", "har_path"):
         if res.get(k):
-            label = {"script_path": "client", "local_path": "copy", "har_path": "capture"}[k]
+            label = {"script_path": "server" if res.get("mcp") else "client", "local_path": "copy", "har_path": "capture"}[k]
             print(f"   {T.sty('└', T.HAIRLINE)} {T.sty(f'{label:<7}', T.DIM)} {T.sty(T.link(str(res[k]), Path(str(res[k])).resolve().as_uri()), T.INK_SOFT)}", file=sys.stderr)
 
 
@@ -765,6 +905,7 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--headless", action="store_true", help="force headless (default)")
     a.add_argument("--headed", action="store_true", help="show the browser window (needs a display)")
     a.add_argument("--dry-run", action="store_true", help="check prerequisites and print what would run")
+    a.add_argument("--mcp", action="store_true", help="generate an MCP server instead of a client")
     scripted(a)
 
     m = sub.add_parser("manual", help="you browse (window or command shell); then the agent engineers the HAR")
@@ -775,6 +916,7 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--headed", action="store_true")
     m.add_argument("--headless", action="store_true", help="command-shell capture even if a display exists")
     m.add_argument("--no-engineer", action="store_true", help="only capture the HAR")
+    m.add_argument("--mcp", action="store_true", help="generate an MCP server instead of a client")
     m.add_argument("--json", action="store_true")
     m.add_argument("-v", "--verbose", action="store_true")
 
@@ -783,6 +925,7 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("-p", "--prompt")
     e.add_argument("--fresh", action="store_true", help="ignore previous scripts and re-engineer from scratch")
     e.add_argument("--har", help="engineer an external .har file (e.g. exported from DevTools)")
+    e.add_argument("--mcp", action="store_true", help="generate an MCP server instead of a client")
     e.add_argument("-m", "--model")
     e.add_argument("-o", "--output-dir")
     scripted(e)
@@ -826,6 +969,49 @@ def build_parser() -> argparse.ArgumentParser:
     mo.add_argument("--all", action="store_true", help="include embedding/guard/etc. models")
     mo.add_argument("--json", action="store_true")
 
+    mc = sub.add_parser("mcp", help="MCP servers for any website: new, from, list, test, config, add, serve, install, remove")
+    msub = mc.add_subparsers(dest="mcp_cmd")
+    mn = msub.add_parser("new", help="browse a site and generate an MCP server with the tools you describe")
+    mn.add_argument("words", nargs="*", help="the tools you want, e.g. search products, product details, reviews")
+    mn.add_argument("-p", "--prompt")
+    mn.add_argument("-u", "--url", help="the website")
+    mn.add_argument("-m", "--model")
+    mn.add_argument("-o", "--output-dir")
+    mn.add_argument("--headed", action="store_true")
+    scripted(mn, stream=False)
+    mf = msub.add_parser("from", help="turn a past run's capture into an MCP server")
+    mf.add_argument("run_id", nargs="?")
+    mf.add_argument("words", nargs="*", help="the tools you want")
+    mf.add_argument("--har", help="an external .har file instead of a run")
+    mf.add_argument("-m", "--model")
+    mf.add_argument("-o", "--output-dir")
+    scripted(mf, stream=False)
+    ml = msub.add_parser("list", help="installed MCP servers")
+    ml.add_argument("--json", action="store_true")
+    for nm, hp in (
+        ("test", "start a server and check it speaks MCP; list its tools"),
+        ("config", "print the config for MCP clients"),
+        ("serve", "run a server (stdio, or --http PORT)"),
+        ("install", "install a run's server under ~/.revapi/mcp"),
+        ("remove", "delete an installed server"),
+    ):
+        sp = msub.add_parser(nm, help=hp)
+        sp.add_argument("target", help="installed name, run id, folder or server.py")
+        if nm == "test":
+            sp.add_argument("--call", help="also call this tool")
+            sp.add_argument("arguments", nargs="?", help="JSON arguments for --call")
+        if nm == "config":
+            sp.add_argument("client", nargs="?", choices=["claude", "codex", "gemini", "opencode", "hermes", "http", "json"])
+            sp.add_argument("--json", action="store_true")
+        if nm == "serve":
+            sp.add_argument("--http", type=int, metavar="PORT", help="Streamable HTTP instead of stdio")
+            sp.add_argument("--host", default="127.0.0.1")
+        if nm == "install":
+            sp.add_argument("--name")
+    ma = msub.add_parser("add", help="register a server with an MCP client on this device")
+    ma.add_argument("target")
+    ma.add_argument("client", choices=["claude", "codex", "gemini", "opencode", "hermes"])
+
     rf = sub.add_parser("refresh", help="open a site, pass any Cloudflare/CAPTCHA check yourself in the live view, save the session")
     rf.add_argument("url")
     rf.add_argument("--timeout", type=int, help="seconds to wait for you (default: handoff_timeout)")
@@ -864,6 +1050,8 @@ def main(argv: list[str] | None = None) -> int:
         print(modes.SCHEMA_VERSION)
         return 0
     cfg = store.Config()
+    if getattr(args, "mcp", False):
+        _use_mcp(cfg)
     if getattr(args, "json", False) or getattr(args, "json_stream", False):
         # keep stdout clean for machine output
         pass
@@ -880,6 +1068,7 @@ def main(argv: list[str] | None = None) -> int:
         "har": cmd_har,
         "models": cmd_models,
         "refresh": cmd_refresh,
+        "mcp": cmd_mcp,
         "cookies": cmd_cookies,
     }
     if not args.cmd:

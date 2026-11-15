@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+import urllib.error
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -73,7 +76,6 @@ def _sse_resp(events: list[dict], die: bool = False) -> _Resp:
 
 def _http_error(code: int, text: str, headers: dict | None = None) -> Exception:
     import io
-    import urllib.error
 
     return urllib.error.HTTPError("http://x", code, "err", headers or {}, io.BytesIO(text.encode()))
 
@@ -308,6 +310,24 @@ class Unit(unittest.TestCase):
         self.assertEqual(kinds[:4], ["thinking", "thinking", "text", "text"])
         self.assertIn("tool", kinds)
 
+    def test_reindexed_argument_tail_joins_its_call(self) -> None:
+        # pollinations re-indexes the tail of a call's arguments without id or name: it must not become a new call
+        events = [
+            {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c1", "function": {"name": "net", "arguments": '{"all":'}}]}}]},
+            {"choices": [{"delta": {"tool_calls": [{"index": 1, "function": {"arguments": "true}"}}]}}]},
+            {"choices": [{"delta": {"tool_calls": [{"index": 1, "id": "c2", "function": {"name": "click", "arguments": '{"ref": "e2"}'}}]}}]},
+            {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+        ]
+        tools = [{"name": "net", "parameters": {"type": "object"}}, {"name": "click", "parameters": {"type": "object"}}]
+        with FakeNet([_sse_resp(events)]):
+            r = LLM(provider="pollinations").chat([{"role": "user", "content": "go"}], tools)
+        self.assertEqual([(c["name"], c["arguments"]) for c in r.tool_calls], [("net", {"all": True}), ("click", {"ref": "e2"})])
+
+    def test_empty_assistant_turn_is_not_sent(self) -> None:
+        msgs = [{"role": "user", "content": "go"}, {"role": "assistant", "content": None}, {"role": "user", "content": "continue"}]
+        body = LLM(provider="pollinations")._openai_body(msgs, None, True)
+        self.assertEqual([m["role"] for m in body["messages"]], ["user", "user"])
+
     def test_think_tags_split(self) -> None:
         got: list[tuple[str, str]] = []
         sp = llmmod.ThinkSplitter(lambda k, s: got.append((k, s)))
@@ -354,7 +374,6 @@ class Unit(unittest.TestCase):
         self.assertEqual([b["type"] for b in body["messages"][1]["content"]], ["thinking", "text", "tool_use"])
 
     def test_retries_network_and_5xx_then_success(self) -> None:
-        import urllib.error
 
         plan = [urllib.error.URLError("dns failure")] * 3 + [ConnectionResetError("reset")] * 2 + [_http_error(503, "busy"), _http_error(529, "overloaded")]
         plan.append(_json({"choices": [{"message": {"content": "back online"}}]}))
@@ -372,7 +391,6 @@ class Unit(unittest.TestCase):
         self.assertGreater(delays[3], delays[0])  # exponential backoff
 
     def test_retries_give_up_after_40(self) -> None:
-        import urllib.error
 
         net = FakeNet([urllib.error.URLError("offline")] * 60)
         with net, mock.patch("revapi.llm._sleep"):
@@ -455,6 +473,18 @@ class Unit(unittest.TestCase):
         out = tools["append_file"].handler(path="c.py", content="b = 2\n")
         self.assertIn("now 3 lines", out)
         self.assertEqual((d / "c.py").read_text(), "a = 1\nb = 2\n")
+
+    def test_gateway_crash_retry_is_nudged(self) -> None:
+        bad = _sse_resp([{"error": {"message": "Chat Completions provider returned invalid or omitted terminal usage", "type": "upstream_error", "code": "usage_missing"}}])
+        good = _sse_resp([{"choices": [{"delta": {"content": "fine"}, "finish_reason": "stop"}]}])
+        net = FakeNet([bad, good])
+        msgs = [{"role": "user", "content": "go"}]
+        with net, mock.patch("revapi.llm._sleep"):
+            r = LLM(provider="pollinations").chat(msgs, None, on_delta=lambda k, p: None, on_retry=lambda *a: None)
+        self.assertEqual(r.content, "fine")
+        first, second = net.calls[0]["body"]["messages"], net.calls[1]["body"]["messages"]
+        self.assertEqual(len(second), len(first) + 1)  # the same context crashes again; the retry differs
+        self.assertIn("previous attempt", second[-1]["content"])
 
     def test_mid_stream_overload_error_is_retried(self) -> None:
         bad = _sse_resp([{"error": {"message": "Provider overloaded, try again", "code": 503}}])
@@ -1146,7 +1176,6 @@ class HumanCheckBrowser(unittest.TestCase):
 
     def test_live_view_pass_then_saved_profile_and_self_clearing(self) -> None:
         import threading
-        import urllib.error
         import urllib.request
 
         from revapi import handoff
@@ -1221,6 +1250,305 @@ class HumanCheckBrowser(unittest.TestCase):
         finally:
             lock.unlink()
         self.assertEqual(shared_profile(), str(p))
+
+
+SAMPLE_SERVER = """from __future__ import annotations
+
+import os
+from typing import Literal
+
+from revapi_mcp import MCP, Session, ToolError
+
+mcp = MCP("todo", instructions="Read and add todos on the fixture site")
+http = Session(os.environ.get("TODO_BASE", "http://127.0.0.1:1"), headers={"X-Client": "fixture"}, cookies="sid=abc123", retries=0)
+
+
+@mcp.tool(read_only=True)
+def list_todos(contains: str | None = None) -> dict:
+    \"\"\"List todos.
+
+    Args:
+        contains: only todos whose title contains this text
+    \"\"\"
+    items = http.get("/api/todos").json()["items"]
+    if contains:
+        items = [t for t in items if contains in t["title"]]
+    return {"count": len(items), "items": items}
+
+
+@mcp.tool
+def add_todo(title: str, priority: Literal["low", "high"] = "low") -> dict:
+    \"\"\"Add a todo.
+
+    Args:
+        title: the text of the todo
+        priority: how urgent it is
+    \"\"\"
+    if not title.strip():
+        raise ToolError("title must not be empty")
+    return http.post("/api/todos", json={"title": title}).json()
+
+
+if __name__ == "__main__":
+    mcp.run()
+"""
+
+
+def _server_dir(base: str) -> Path:
+    from revapi import mcpgen
+
+    d = Path(tempfile.mkdtemp())
+    (d / "server.py").write_text(SAMPLE_SERVER)
+    (d / "revapi_mcp.py").write_text(mcpgen.RUNTIME.read_text())
+    (d / "README.md").write_text("# todo\n")
+    os.environ["TODO_BASE"] = base
+    return d
+
+
+class McpRuntime(unittest.TestCase):
+    """The stdlib MCP runtime copied next to every generated server."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.srv = serve()
+        cls.base = f"http://127.0.0.1:{cls.srv.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.srv.shutdown()
+
+    def test_schema_from_hints_and_docstrings(self) -> None:
+        from typing import Literal
+
+        from revapi.mcp_runtime import MCP
+
+        m = MCP("t")
+
+        @m.tool(read_only=True)
+        def search(query: str, limit: int = 20, sort: Literal["new", "top"] = "new", tags: list[str] | None = None, exact: bool = False) -> dict:
+            """Search posts.
+
+            Longer explanation.
+
+            Args:
+                query: words to look for
+                limit: how many
+                    results, 1-100
+            """
+            return {"q": query, "limit": limit, "sort": sort, "tags": tags, "exact": exact}
+
+        spec = m.tools["search"].spec()
+        props = spec["inputSchema"]["properties"]
+        self.assertEqual(spec["description"], "Search posts.\n\nLonger explanation.")
+        self.assertEqual(spec["inputSchema"]["required"], ["query"])
+        self.assertEqual(props["query"], {"type": "string", "description": "words to look for"})
+        self.assertEqual(props["limit"], {"type": "integer", "description": "how many results, 1-100", "default": 20})
+        self.assertEqual(props["sort"], {"enum": ["new", "top"], "type": "string", "default": "new"})
+        self.assertEqual(props["tags"], {"type": "array", "items": {"type": "string"}})
+        self.assertEqual(props["exact"]["type"], "boolean")
+        self.assertEqual(spec["annotations"], {"readOnlyHint": True})
+        # client mistakes are coerced; bad calls come back as tool errors, not crashes
+        r = m.call_tool("search", {"query": "x", "limit": "5", "exact": "true", "tags": '["a"]'})
+        self.assertEqual(r["structuredContent"], {"q": "x", "limit": 5, "sort": "new", "tags": ["a"], "exact": True})
+        self.assertTrue(m.call_tool("search", {})["isError"])
+        self.assertIn("unknown argument", m.call_tool("search", {"query": "x", "nope": 1})["content"][0]["text"])
+
+    def test_protocol_messages(self) -> None:
+        from revapi.mcp_runtime import MCP
+
+        m = MCP("t", instructions="hi")
+        m.tool(lambda: "pong", name="ping_tool")
+        init = m.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05"}})
+        self.assertEqual(init["result"]["protocolVersion"], "2024-11-05")  # an older client keeps its version
+        self.assertEqual(init["result"]["instructions"], "hi")
+        newer = m.handle({"jsonrpc": "2.0", "id": 2, "method": "initialize", "params": {"protocolVersion": "2099-01-01"}})
+        self.assertEqual(newer["result"]["protocolVersion"], "2025-11-25")
+        self.assertIsNone(m.handle({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+        self.assertEqual(m.handle({"jsonrpc": "2.0", "id": 3, "method": "ping"})["result"], {})
+        self.assertEqual(m.handle({"jsonrpc": "2.0", "id": 4, "method": "nope"})["error"]["code"], -32601)
+        self.assertEqual(m.handle({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "zzz"}})["error"]["code"], -32602)
+        batch = m.handle([{"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {"name": "ping_tool"}}, {"jsonrpc": "2.0", "method": "notifications/x"}])
+        self.assertEqual(batch[0]["result"]["content"][0]["text"], "pong")
+
+    def test_stdio_and_http_transports_against_the_site(self) -> None:
+        import socket
+        import urllib.request
+
+        from revapi import mcpgen
+
+        d = _server_dir(self.base)
+        info = mcpgen.handshake(d / "server.py")
+        self.assertEqual((info["server"]["name"], info["protocol"]), ("todo", "2025-11-25"))
+        self.assertEqual([t["name"] for t in info["tools"]], ["list_todos", "add_todo"])
+        r = subprocess.run([sys.executable, "server.py", "--call", "add_todo", '{"title": "via mcp"}'], cwd=d, capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('"title": "via mcp"', r.stdout)
+        r = subprocess.run([sys.executable, "server.py", "--call", "add_todo", '{"title": " "}'], cwd=d, capture_output=True, text=True, timeout=30)
+        self.assertEqual((r.returncode, r.stdout.strip()), (1, "title must not be empty"))
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        p = subprocess.Popen([sys.executable, "server.py", "--http", str(port)], cwd=d, stderr=subprocess.DEVNULL)
+        try:
+            url = f"http://127.0.0.1:{port}/mcp"
+
+            def post(obj: dict) -> tuple[int, dict, Any]:
+                req = urllib.request.Request(url, data=json.dumps(obj).encode(), headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"})
+                for _ in range(50):
+                    try:
+                        with urllib.request.urlopen(req, timeout=10) as resp:
+                            raw = resp.read()
+                            return resp.status, dict(resp.headers), json.loads(raw) if raw else None
+                    except urllib.error.URLError:
+                        time.sleep(0.1)
+                raise AssertionError("server did not start")
+
+            code, headers, body = post({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25"}})
+            self.assertEqual(code, 200)
+            self.assertIn("Mcp-Session-Id", headers)
+            self.assertEqual(post({"jsonrpc": "2.0", "method": "notifications/initialized"})[0], 202)
+            _, _, body = post({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "list_todos", "arguments": {"contains": "via mcp"}}})
+            self.assertEqual(body["result"]["structuredContent"]["count"], 1)
+        finally:
+            p.terminate()
+            p.wait(5)
+
+    def test_session_cookies_saved_session_and_expiry(self) -> None:
+        from revapi import handoff
+        from revapi.mcp_runtime import HTTPError, Session, SessionExpired
+
+        s = Session(self.base, retries=0, use_saved_session=False)
+        with self.assertRaises(HTTPError) as cm:
+            s.get("/api/todos")
+        self.assertEqual(cm.exception.response.status, 401)
+        s.get("/")  # the page sets the sid cookie in the jar
+        self.assertEqual(s.cookies.get("sid"), "abc123")
+        self.assertIn("items", s.get("/api/todos").json())
+        # a check page means the saved session expired: the error names the renew command
+        with self.assertRaises(SessionExpired) as cm2:
+            Session(self.base, retries=0, use_saved_session=False).get("/gate")
+        self.assertIn(f"revapi refresh {self.base}", str(cm2.exception))
+        # revapi's saved session (after a passed check) is loaded with its exact user agent
+        handoff.write_session("127.0.0.1", [{"name": "cf_clearance", "value": "ok", "domain": "127.0.0.1", "path": "/"}], "Mozilla/5.0 SavedUA", "test")
+        try:
+            s2 = Session(self.base, retries=0)
+            self.assertEqual(s2.headers["User-Agent"], "Mozilla/5.0 SavedUA")
+            self.assertIn("Members area", s2.get("/gate").text)
+        finally:
+            handoff.session_path("127.0.0.1").unlink()
+
+
+class McpManage(unittest.TestCase):
+    """revapi mcp: names, install, list, config, add to clients, remove."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.srv = serve()
+        cls.base = f"http://127.0.0.1:{cls.srv.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.srv.shutdown()
+
+    def test_names(self) -> None:
+        from revapi.mcpgen import name_for
+
+        self.assertEqual(name_for("https://www.shop.example.com/x"), "shop-example")
+        self.assertEqual(name_for("https://github.com"), "github")
+        self.assertEqual(name_for("http://127.0.0.1:8080"), "127-0-0-1")
+        self.assertEqual(name_for(None, "make an MCP server for the hacker news front page"), "hacker-news-front-page")
+
+    def test_install_config_add_remove(self) -> None:
+        import contextlib
+        import io
+
+        from revapi import cli, mcpgen
+
+        d = _server_dir(self.base)
+        meta = mcpgen.install(d, "todo-test", "r1", self.base, "todos")
+        self.assertEqual(meta["tools"], ["list_todos", "add_todo"])
+        dst = mcpgen.server_dir("todo-test")
+        self.assertTrue((dst / "revapi_mcp.py").exists() and (dst / "README.md").exists())
+        self.assertEqual(mcpgen.name_for_run("r1", "http://other.site", ""), "todo-test")  # re-engineering updates it
+        self.assertEqual(mcpgen.name_for_run("r2", None, "todo test"), "todo-test-2")  # a new run never overwrites
+        out = io.StringIO()
+        home = Path(tempfile.mkdtemp())
+        (home / ".gemini").mkdir()
+        (home / ".gemini" / "settings.json").write_text(json.dumps({"theme": "dark", "mcpServers": {"other": {"command": "x"}}}))
+        with contextlib.redirect_stdout(out), mock.patch.dict(os.environ, {"HOME": str(home)}), mock.patch("pathlib.Path.home", lambda: home):
+            self.assertEqual(cli.main(["mcp", "list", "--json"]), 0)
+            self.assertEqual(cli.main(["mcp", "test", "todo-test"]), 0)
+            self.assertEqual(cli.main(["mcp", "config", "todo-test", "--json"]), 0)
+            for client in ("codex", "gemini", "opencode"):
+                self.assertEqual(cli.main(["mcp", "add", "todo-test", client]), 0)
+            self.assertEqual(cli.main(["mcp", "add", "todo-test", "codex"]), 0)  # idempotent
+        text = out.getvalue()
+        listed = json.loads(text.splitlines()[0])
+        self.assertTrue(any(s["name"] == "todo-test" for s in listed["servers"]))
+        self.assertIn("MCP 2025-11-25 · 2 tools", termmod.strip_ansi(text))
+        self.assertIn("add_todo(title, priority?)", termmod.strip_ansi(text))
+        server = str(dst / "server.py")
+        codex = (home / ".codex" / "config.toml").read_text()
+        self.assertEqual(codex.count("[mcp_servers.todo-test]"), 1)
+        self.assertIn(json.dumps(server), codex)
+        gem = json.loads((home / ".gemini" / "settings.json").read_text())
+        self.assertEqual((gem["theme"], gem["mcpServers"]["todo-test"]["args"], "other" in gem["mcpServers"]), ("dark", [server], True))
+        self.assertTrue((home / ".gemini" / "settings.json.bak").exists())
+        oc = json.loads((home / ".config" / "opencode" / "opencode.json").read_text())
+        self.assertEqual(oc["mcp"]["todo-test"]["command"][1:], [server])
+        cfgs = mcpgen.config(dst / "server.py", "todo-test")
+        self.assertIn(f"claude mcp add todo-test -- {sys.executable} {server}", cfgs["claude"])
+        self.assertIn("--http 8811", cfgs["http"])
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.main(["mcp", "remove", "todo-test"]), 0)
+        self.assertFalse(dst.exists())
+
+    def test_output_mode_and_prompts(self) -> None:
+        cfg = _cfg()
+        cfg.set("output_mode", "mcp")
+        with self.assertRaises(ValueError):
+            cfg.set("output_mode", "server")
+        d = Path(tempfile.mkdtemp())
+        cg = modes.Codegen("go", "mcp", d)
+        self.assertEqual((cg.language, cg.client_filename(), cg.label), ("python", "server.py", "MCP server"))
+        cg.prepare()
+        self.assertEqual((d / "revapi_mcp.py").read_text(), (ROOT / "revapi" / "mcp_runtime.py").read_text())
+        text = cg.instructions()
+        for want in ("from revapi_mcp import MCP, Session", "@mcp.tool(read_only=True)", "--call <tool>", "Never use the `mcp`/`fastmcp` packages", str(d)):
+            self.assertIn(want, text)
+        self.assertNotIn("{{", text)
+        self.assertIsNone(modes._main_script(d, cg))  # the runtime alone is not a server
+
+    def test_agent_run_in_mcp_mode_installs_the_server(self) -> None:
+        """A scripted model writes server.py on the bundled runtime; revapi tests and installs it."""
+        server = SAMPLE_SERVER.replace('os.environ.get("TODO_BASE", "http://127.0.0.1:1")', repr(self.base))
+        seen_runtime: list[bool] = []
+
+        def write(messages):  # noqa: ANN001
+            sys_prompt = messages[0]["content"]
+            assert "Generate an MCP server" in sys_prompt and "revapi_mcp.py" in sys_prompt, sys_prompt[:300]
+            scripts = Path(re.search(r"`([^`]+)/revapi_mcp\.py`", sys_prompt).group(1))
+            seen_runtime.append((scripts / "revapi_mcp.py").exists())
+            return [("write_file", {"path": "server.py", "content": server}), ("write_file", {"path": "README.md", "content": "# todo mcp\n"})]
+
+        script = [
+            write,
+            [("shell", {"command": "python3 server.py --list && python3 server.py --call list_todos '{}'"})],
+            [("finish", {"summary": "MCP server with list_todos and add_todo; both tested.", "script_path": "server.py"})],
+        ]
+        fake = FakeLLM(script)
+        cfg = _cfg()
+        cfg.data["output_mode"] = "mcp"
+        with mock.patch.object(modes, "make_llm", lambda *a, **k: fake):
+            res = modes.run_agent("tools to list and add todos", self.base, cfg, Reporter(quiet=True))
+        self.assertEqual(res["status"], "ok", res.get("error"))
+        self.assertEqual(seen_runtime, [True])  # the runtime was in place before the model wrote anything
+        shell_out = next(m["content"] for m in fake.seen[-1] if m.get("role") == "tool" and "list_todos" in (m.get("content") or ""))
+        self.assertIn('"count"', shell_out)
+        self.assertEqual(res["mcp"]["tools"], ["list_todos", "add_todo"])
+        self.assertTrue(res["script_path"].endswith(f"mcp/{res['mcp']['name']}/server.py"))
+        self.assertEqual(res["mcp"]["name"], "127-0-0-1")
 
 
 if __name__ == "__main__":

@@ -31,8 +31,9 @@ SCHEMA_VERSION = 1
 
 class Codegen:
     def __init__(self, language: str, output_mode: str, scripts: Path) -> None:
-        self.language = language if language in store.LANGUAGES else "python"
-        self.mode = output_mode
+        self.mode = output_mode if output_mode in store.OUTPUT_MODES else "client"
+        # MCP servers are always Python on the bundled stdlib runtime: nothing to compile on Termux
+        self.language = "python" if self.mode == "mcp" else (language if language in store.LANGUAGES else "python")
         self.scripts = scripts
         self.name = store.LANGUAGE_NAMES[self.language]
 
@@ -40,12 +41,33 @@ class Codegen:
     def docs(self) -> bool:
         return self.mode == "docs"
 
+    @property
+    def mcp(self) -> bool:
+        return self.mode == "mcp"
+
+    @property
+    def label(self) -> str:
+        return "OpenAPI docs" if self.docs else "MCP server" if self.mcp else self.name
+
+    def prepare(self) -> None:
+        """Put the MCP runtime next to the server the agent writes (refreshed when revapi updates it)."""
+        if self.mcp:
+            self.scripts.mkdir(parents=True, exist_ok=True)
+            src = Path(__file__).with_name("mcp_runtime.py").read_text(encoding="utf-8")
+            dst = self.scripts / "revapi_mcp.py"
+            if not dst.exists() or dst.read_text(encoding="utf-8") != src:
+                dst.write_text(src, encoding="utf-8")
+
     def client_filename(self) -> str:
+        if self.mcp:
+            return "server.py"
         return "openapi.json" if self.docs else f"api_client{store.LANGUAGES[self.language]}"
 
     def run_command(self) -> str:
         d = self.scripts.resolve()
         q = lambda p: f"'{p}'"  # noqa: E731
+        if self.mcp:
+            return "python server.py --list"
         return {
             "java": f"mvn -q -f {q(d / 'pom.xml')} compile exec:exec",
             "csharp": f"dotnet run --project {q(d / 'ApiClient.csproj')}",
@@ -59,11 +81,19 @@ class Codegen:
         }.get(self.language, "python api_client.py")
 
     def instructions(self) -> str:
+        if self.mcp:
+            return load("partials/_mcp_instructions", scripts_dir=self.scripts)
         if self.docs:
             return load("partials/_docs_instructions", scripts_dir=self.scripts)
         return load(f"partials/_language_{self.language}", scripts_dir=self.scripts, client_filename=self.client_filename(), run_command=self.run_command())
 
     def output_files(self) -> str:
+        if self.mcp:
+            return (
+                f"1. `{self.scripts}/server.py` - the MCP server (tools for what the user asked)\n"
+                f"2. `{self.scripts}/README.md` - tools, examples, auth and how to add it to an MCP client\n"
+                f"(`{self.scripts}/revapi_mcp.py` is the runtime revapi put there: keep it, don't edit it)"
+            )
         if self.docs:
             return f"1. `{self.scripts}/openapi.json` - OpenAPI 3.0 spec\n2. `{self.scripts}/README.md` - API documentation"
         base = f"1. `{self.scripts}/{self.client_filename()}` - Production {self.name} API client\n2. `{self.scripts}/README.md` - Documentation with usage examples"
@@ -135,13 +165,15 @@ def terminal_ask(question: str, options: list[str] | None) -> str:
 
 
 def _main_script(scripts: Path, cg: Codegen, hint: str = "") -> str | None:
-    if hint:
+    if hint and not (cg.mcp and Path(hint).name == "revapi_mcp.py"):
         p = Path(hint) if Path(hint).is_absolute() else scripts / hint
         if p.exists():
             return str(p)
     p = scripts / cg.client_filename()
     if p.exists():
         return str(p)
+    if cg.mcp:  # the runtime alone is not a server
+        return None
     found = store.discover_scripts(scripts)
     return str(found[0]) if found else None
 
@@ -152,6 +184,28 @@ def _start_sync(cfg: store.Config, scripts: Path, prompt: str, rep: Reporter) ->
     dst = store.available_dir(Path.cwd() / "scripts", store.slugify(prompt))
     rep.log(dim(f"  syncing output → {dst}"))
     return store.Syncer(scripts, dst).start()
+
+
+def _mcp_install(result: dict, cg: Codegen | None, run_id: str, rep: Reporter) -> None:
+    """After an MCP run: install the server under ~/.revapi/mcp/<name> and say how to use it."""
+    if not cg or not cg.mcp or result.get("error") or not result.get("script_path"):
+        return
+    from . import mcpgen
+
+    rec = store.History().get(run_id) or {}
+    try:
+        meta = mcpgen.install(Path(result["script_path"]).parent, mcpgen.name_for_run(run_id, rec.get("url"), rec.get("prompt")), run_id, rec.get("url"), rec.get("prompt") or "")
+    except (OSError, FileNotFoundError) as e:
+        rep.log(f"   could not install the MCP server: {e}")
+        return
+    result["mcp"] = {k: meta[k] for k in ("name", "path", "tools")}
+    result["script_path"] = meta["path"]
+    rep.emit("mcp_installed", **result["mcp"])
+    tools = ", ".join(meta["tools"][:6]) + (" …" if len(meta["tools"]) > 6 else "")
+    rep.log(f"   ◇ MCP server {bold(meta['name'])} · {len(meta['tools'])} tools{': ' + tools if tools else ''}")
+    if meta.get("error"):
+        rep.log(yellow(f"     it did not list its tools: {meta['error'][:300]}"))
+    rep.log(dim(f"     add it to a client: revapi mcp add {meta['name']} claude|codex|gemini|opencode · or: revapi mcp config {meta['name']}"))
 
 
 def _finish_record(hist: store.History, run_id: str, result: dict, extra: dict | None = None) -> None:
@@ -171,6 +225,7 @@ def payload(mode: str, run_id: str | None, prompt: str | None, result: dict, **e
         "usage": result.get("usage", {}),
         "error": result.get("error"),
         "error_kind": result.get("error_kind"),
+        **({"mcp": result["mcp"]} if result.get("mcp") else {}),
     }
 
 
@@ -197,11 +252,12 @@ def run_agent(
     scripts = store.scripts_dir(run_id, output_dir)
     har = store.har_path(run_id, output_dir)
     cg = Codegen(cfg.get("output_language"), cfg.get("output_mode"), scripts)
+    cg.prepare()
     hist = store.History()
     hist.upsert(store.make_record(run_id, "agent", prompt, llm.describe(), url, output_dir, output_mode=cg.mode, output_language=cg.language, provider=llm.provider))
     rep.emit("run_started", run_id=run_id, mode="agent", model=llm.describe(), har_path=str(har), scripts_dir=str(scripts))
     _setup_rep(rep, cfg, "agent")
-    rep.run_header("agent", run_id, llm.describe(), cg.name if not cg.docs else "OpenAPI docs")
+    rep.run_header("agent", run_id, llm.describe(), cg.label)
     ctx = Context(
         workdir=scripts,
         har_path=har,
@@ -231,6 +287,7 @@ def run_agent(
     if not result.get("error") and not result["script_path"]:
         result["error"], result["error_kind"] = f"the agent finished without writing a client in {scripts}", "engine_failure"
     _finish_record(hist, run_id, result, {"paths": {"har_path": str(har) if har.exists() else None, "script_path": result["script_path"], "local_path": str(syncer.dst) if syncer else None}})
+    _mcp_install(result, cg, run_id, rep)
     if not result.get("error"):
         rep.card(result["script_path"], llm.describe())
     rep.footer()
@@ -274,6 +331,7 @@ def run_engineer(
     provider = "hermes" if llm is None else llm.provider
     scripts = store.scripts_dir(run_id, output_dir)
     cg = Codegen(cfg.get("output_language"), cfg.get("output_mode"), scripts)
+    cg.prepare()
     original = (rec or {}).get("prompt") or ""
     main_prompt = prompt if (fresh or not original) else original
     additional = prompt if (prompt and original and not fresh) else ""
@@ -281,6 +339,7 @@ def run_engineer(
     if fresh and scripts.exists():
         for p in scripts.iterdir():
             shutil.rmtree(p) if p.is_dir() else p.unlink()
+    cg.prepare()
     if not rec:
         hist.upsert(store.make_record(run_id, "engineer", main_prompt or "(engineer HAR)", label, None, output_dir, output_mode=cg.mode, output_language=cg.language, provider=provider))
     hist.update(run_id, status="running", model=label, last_engineered=time.strftime("%Y-%m-%dT%H:%M:%S"))
@@ -299,8 +358,12 @@ def run_engineer(
     )
     system = load(
         "engineer_system",
-        mode_description="generate an OpenAPI 3.0 specification documenting" if cg.docs else f"reverse engineer API calls and generate production-ready {cg.name} code that replicates",
-        task_description="OpenAPI documentation" if cg.docs else f"{cg.name} API client",
+        mode_description="generate an OpenAPI 3.0 specification documenting"
+        if cg.docs
+        else "reverse engineer API calls and generate a working MCP server whose tools replicate"
+        if cg.mcp
+        else f"reverse engineer API calls and generate production-ready {cg.name} code that replicates",
+        task_description="OpenAPI documentation" if cg.docs else "MCP server" if cg.mcp else f"{cg.name} API client",
         codegen_instructions=cg.instructions(),
         scratchpad_extra="" if cg.docs else "- Decide whether plain HTTP will be sufficient or if a browser context is needed",
         attempt_log_section=attempt,
@@ -315,23 +378,23 @@ def run_engineer(
     guidance = ""
     if existing:
         guidance = (
-            f"\nThere is already an existing {cg.name} client for this run:\n<existing_client>\n{existing}\n</existing_client>\n\n"
+            f"\nThere is already an existing {cg.label if cg.mcp else cg.name + ' client'} for this run:\n<existing_client>\n{existing}\n</existing_client>\n\n"
             f"**IMPORTANT: This is an iterative edit. Update that file in place and keep the implementation in {cg.name} unless the user explicitly asks for a fresh rewrite.**\n"
         )
     user = load(
         "engineer_user",
         har_path=har,
-        prompt=main_prompt or "Reverse engineer every API in this traffic into a client.",
+        prompt=main_prompt or ("Reverse engineer the APIs in this traffic into an MCP server with useful tools." if cg.mcp else "Reverse engineer every API in this traffic into a client."),
         scripts_dir=scripts,
         existing_client_guidance=guidance,
         additional_instructions=f"\n\nAdditional instructions:\n{additional}" if additional else "",
         tag_mode_label="Documentation" if cg.docs else "Re-engineer",
         run_id=run_id,
         har_parent=har.parent,
-        existing_label="docs" if cg.docs else "scripts",
+        existing_label="docs" if cg.docs else "server" if cg.mcp else "scripts",
         messages_path=store.messages_path(run_id, output_dir).parent,
         is_fresh=str(fresh).lower(),
-        existing_artifact="documentation" if cg.docs else "script",
+        existing_artifact="documentation" if cg.docs else "MCP server" if cg.mcp else "script",
     )
     if use_hermes:
         return _engineer_hermes(cfg, rep, run_id, prompt, fresh, har, scripts, cg, system, user, main_prompt, output_dir, hist, keep)
@@ -350,6 +413,7 @@ def run_engineer(
     if not result.get("error") and not result["script_path"]:
         result["error"], result["error_kind"] = f"engineering finished without writing output in {scripts}", "engine_failure"
     _finish_record(hist, run_id, result, {"paths": {"har_path": str(har), "script_path": result["script_path"], "local_path": str(syncer.dst) if syncer else None}})
+    _mcp_install(result, cg, run_id, rep)
     if not result.get("error"):
         rep.card(result["script_path"], llm.describe())
     rep.footer()
@@ -420,6 +484,8 @@ def _hermes_result(hr: Any, rep: Reporter, hist: store.History, run_id: str, pro
     if extra.get("har"):
         paths["har_path"] = str(extra["har"])
     _finish_record(hist, run_id, result, {"paths": paths})
+    _mcp_install(result, cg, run_id, rep)
+    script = result.get("script_path") or script
     if not error:
         rep.card(script, hr.label)
     rep.footer()
@@ -805,6 +871,7 @@ def resume(run_id: str, cfg: store.Config, rep: Reporter, model: str | None = No
         scripts = store.scripts_dir(run_id, output_dir)
         hr = HermesRun(scripts, rep, cfg.get("hermes_model"), cfg.get("hermes_provider"), cfg.get("hermes_max_turns"), mp, rec["hermes_session"])
         cg = Codegen(rec.get("output_language") or cfg.get("output_language"), rec.get("output_mode") or cfg.get("output_mode"), scripts)
+        cg.prepare()
         return {"hermes": hr, "agent": None, "ctx": None, "run_id": run_id, "mode": "engineer", "cg": cg, "output_dir": output_dir}
     msgs = Agent.load_messages(mp)
     scripts = store.scripts_dir(run_id, output_dir) if mode != "collector" else store.collected_dir(run_id, output_dir)
@@ -833,6 +900,7 @@ def resume(run_id: str, cfg: store.Config, rep: Reporter, model: str | None = No
     )
     _wire_notify(ctx, agent)
     cg = Codegen(rec.get("output_language") or cfg.get("output_language"), rec.get("output_mode") or cfg.get("output_mode"), scripts)
+    cg.prepare()
     return {"agent": agent, "ctx": ctx, "run_id": run_id, "mode": mode, "cg": cg, "output_dir": output_dir}
 
 
@@ -872,6 +940,8 @@ def follow_up(keep: dict, text: str, rep: Reporter) -> dict:
     prev = (hist.get(keep["run_id"]) or {}).get("usage") or {}
     total = {k: (prev.get(k) or 0) + (v or 0) for k, v in result["usage"].items() if isinstance(v, (int, float))}
     _finish_record(hist, keep["run_id"], {**result, "usage": total})
+    if keep["mode"] != "collector":
+        _mcp_install(result, cg, keep["run_id"], rep)
     if not result.get("error") and keep["mode"] != "collector":
         rep.card(result["script_path"], agent.llm.describe())
     rep.footer()

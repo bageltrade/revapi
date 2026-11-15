@@ -72,6 +72,7 @@ COMMANDS = {
     "/mode": "choose the mode",
     "/language": "the client's language",
     "/docs": "write OpenAPI docs instead of a client (toggle)",
+    "/mcp": "write an MCP server for the site instead of a client (toggle)",
     "/settings": "all settings",
     "/history": "past runs: their details, resume or re-engineer",
     "/resume": "a past run's conversation, to continue it",
@@ -148,7 +149,7 @@ CHOICES = {
     "effort": [("", "auto", "the model's default")] + [(e, e, EFFORT_NOTES[e]) for e in store.EFFORTS],
     "engine": [("revapi", "revapi", "the built-in agent, any provider"), ("hermes", "hermes", "the local Hermes CLI engineers saved captures")],
     "output_language": [(lang, lang, "") for lang in store.LANGUAGES],
-    "output_mode": [("client", "client", "a working API client"), ("docs", "docs", "an OpenAPI 3.0 spec")],
+    "output_mode": [("client", "client", "a working API client"), ("docs", "docs", "an OpenAPI 3.0 spec"), ("mcp", "mcp", "an MCP server with the tools you ask for")],
     "handoff": [
         ("auto", "auto", "live view when a terminal is attached"),
         ("live", "live", "always open the live view so you can pass the check"),
@@ -1557,6 +1558,8 @@ class Session:
                 self.open_picker("the client's language", CHOICES["output_language"], self.cfg.get("output_language"), pick)
         elif cmd == "/docs":
             self.save_setting("output_mode", "client" if self.cfg.get("output_mode") == "docs" else "docs")
+        elif cmd == "/mcp":
+            self.save_setting("output_mode", "client" if self.cfg.get("output_mode") == "mcp" else "mcp")
         elif cmd == "/settings":
             if arg:
                 k, _, v = arg.partition(" ")

@@ -57,7 +57,7 @@ DEFAULTS: dict[str, Any] = {
     "effort": None,  # low | medium | high | xhigh | max
     "collector_model": None,
     "output_language": "python",
-    "output_mode": "client",  # client | docs
+    "output_mode": "client",  # client | docs | mcp
     "output_dir": None,  # None -> ~/.revapi/runs
     "real_time_sync": True,  # mirror generated files into ./scripts/<name> while engineering
     "headless": True,
@@ -82,6 +82,9 @@ DEFAULTS: dict[str, Any] = {
     "hermes_provider": None,  # None -> the provider your Hermes config selects
     "hermes_max_turns": None,  # None -> the turn cap from your Hermes config
 }
+
+
+OUTPUT_MODES = ("client", "docs", "mcp")
 
 
 def app_dir() -> Path:
@@ -119,8 +122,8 @@ class Config:
             raise ValueError("engine must be revapi or hermes")
         if key == "hermes_max_turns" and value is not None and (not isinstance(value, int) or value < 1):
             raise ValueError("hermes_max_turns must be a positive integer (or none)")
-        if key == "output_mode" and value not in ("client", "docs"):
-            raise ValueError("output_mode must be client or docs")
+        if key == "output_mode" and value not in OUTPUT_MODES:
+            raise ValueError("output_mode must be client, docs or mcp")
         if key == "compact_at" and value is not None:
             value = float(value)
             if not 0.3 <= value <= 0.95:
